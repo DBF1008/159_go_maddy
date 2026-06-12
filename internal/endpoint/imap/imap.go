@@ -26,6 +26,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/emersion/go-imap"
 	compress "github.com/emersion/go-imap-compress"
@@ -67,6 +68,8 @@ type Endpoint struct {
 	storageNormalize authz.NormalizeFunc
 	storageMap       module.Table
 
+	authTimeout time.Duration
+
 	log *log.Logger
 }
 
@@ -107,10 +110,12 @@ func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	config.EnumMapped(cfg, "auth_map_normalize", true, false, authz.NormalizeFuncs, authz.NormalizeAuto,
 		&endp.saslAuth.AuthNormalize)
 	modconfig.Table(cfg, "auth_map", true, false, nil, &endp.saslAuth.AuthMap)
+	cfg.Duration("auth_timeout", false, false, auth.DefaultAuthTimeout, &endp.authTimeout)
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
 
+	endp.saslAuth.AuthTimeout = endp.authTimeout
 	endp.saslAuth.Log.Debug = endp.log.Debug
 
 	addresses := make([]config.Endpoint, 0, len(endp.addrs))
@@ -145,8 +150,8 @@ func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 
 	for _, mech := range endp.saslAuth.SASLMechanisms() {
 		endp.serv.EnableAuth(mech, func(c imapserver.Conn) sasl.Server {
-			return endp.saslAuth.CreateSASL(mech, c.Info().RemoteAddr, func(identity string, data auth.ContextData) error {
-				return endp.openAccount(c, identity)
+			return endp.saslAuth.CreateSASL(mech, c.Info().RemoteAddr, func(ctx context.Context, identity string, data auth.ContextData) error {
+				return endp.openAccount(ctx, c, identity)
 			})
 		})
 	}
@@ -258,8 +263,8 @@ func (endp *Endpoint) usernameForStorage(ctx context.Context, saslUsername strin
 	return mapped, nil
 }
 
-func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
-	username, err := endp.usernameForStorage(context.TODO(), identity)
+func (endp *Endpoint) openAccount(ctx context.Context, c imapserver.Conn, identity string) error {
+	username, err := endp.usernameForStorage(ctx, identity)
 	if err != nil {
 		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
 			return err
@@ -268,7 +273,7 @@ func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
 		return fmt.Errorf("internal server error")
 	}
 
-	u, err := endp.Store.GetOrCreateIMAPAcct(username)
+	u, err := endp.Store.GetOrCreateIMAPAcct(ctx, username)
 	if err != nil {
 		return err
 	}
@@ -279,14 +284,17 @@ func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
 }
 
 func (endp *Endpoint) Login(connInfo *imap.ConnInfo, username, password string) (imapbackend.User, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), endp.authTimeout)
+	defer cancel()
+
 	// saslAuth handles AuthMap calling.
-	err := endp.saslAuth.AuthPlain(username, password)
+	err := endp.saslAuth.AuthPlain(ctx, username, password)
 	if err != nil {
 		endp.log.Error("authentication failed", err, "username", username, "src_ip", connInfo.RemoteAddr)
 		return nil, imapbackend.ErrInvalidCredentials
 	}
 
-	storageUsername, err := endp.usernameForStorage(context.TODO(), username)
+	storageUsername, err := endp.usernameForStorage(ctx, username)
 	if err != nil {
 		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
 			return nil, err
@@ -295,7 +303,7 @@ func (endp *Endpoint) Login(connInfo *imap.ConnInfo, username, password string) 
 		return nil, fmt.Errorf("internal server error")
 	}
 
-	return endp.Store.GetOrCreateIMAPAcct(storageUsername)
+	return endp.Store.GetOrCreateIMAPAcct(ctx, storageUsername)
 }
 
 func (endp *Endpoint) I18NLevel() int {

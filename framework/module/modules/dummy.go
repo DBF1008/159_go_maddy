@@ -36,7 +36,7 @@ import (
 // and the actual server code (but the latter is kinda pointless).
 type Dummy struct{ instName string }
 
-func (d *Dummy) AuthPlain(username, _ string) error {
+func (d *Dummy) AuthPlain(_ context.Context, username, _ string) error {
 	return nil
 }
 

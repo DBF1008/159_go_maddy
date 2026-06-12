@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package shadow
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -110,7 +111,7 @@ func (a *Auth) Lookup(username string) (string, bool, error) {
 	return "", true, nil
 }
 
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(_ context.Context, username, password string) error {
 	if a.useHelper {
 		return external.AuthUsingHelper(a.helperPath, username, password)
 	}

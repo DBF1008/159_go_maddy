@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package dovecotsasl
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -136,7 +137,7 @@ func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
 	return nil
 }
 
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(_ context.Context, username, password string) error {
 	if _, ok := a.mechanisms[sasl.Plain]; ok {
 		cl, err := a.getConn()
 		if err != nil {

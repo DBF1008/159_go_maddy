@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/emersion/go-sasl"
 	"github.com/foxcpp/maddy/framework/config"
@@ -32,6 +33,11 @@ import (
 	"github.com/foxcpp/maddy/internal/auth/sasllogin"
 	"github.com/foxcpp/maddy/internal/authz"
 )
+
+// DefaultAuthTimeout is the default timeout applied to each individual
+// authentication operation (table lookup, credential verification, etc.)
+// within the SASL exchange.
+const DefaultAuthTimeout = 30 * time.Second
 
 var (
 	ErrUnsupportedMech = errors.New("unsupported SASL mechanism")
@@ -53,6 +59,10 @@ type SASLAuth struct {
 
 	AuthMap       module.Table
 	AuthNormalize authz.NormalizeFunc
+
+	// AuthTimeout is the timeout applied to each individual authentication
+	// operation within the SASL callback. If zero, DefaultAuthTimeout is used.
+	AuthTimeout time.Duration
 
 	ErrorMap func(err error) error
 
@@ -100,14 +110,14 @@ func (s *SASLAuth) usernameForAuth(ctx context.Context, saslUsername string) (st
 	return mapped, nil
 }
 
-func (s *SASLAuth) AuthPlain(username, password string) error {
+func (s *SASLAuth) AuthPlain(ctx context.Context, username, password string) error {
 	if len(s.Plain) == 0 {
 		return ErrUnsupportedMech
 	}
 
 	var lastErr error
 	for _, p := range s.Plain {
-		mappedUsername, err := s.usernameForAuth(context.TODO(), username)
+		mappedUsername, err := s.usernameForAuth(ctx, username)
 		if err != nil {
 			return err
 		}
@@ -116,7 +126,7 @@ func (s *SASLAuth) AuthPlain(username, password string) error {
 			"mapped_username", mappedUsername, "original_username", username,
 			"module", p)
 
-		lastErr = p.AuthPlain(mappedUsername, password)
+		lastErr = p.AuthPlain(ctx, mappedUsername, password)
 		if lastErr == nil {
 			return nil
 		}
@@ -133,10 +143,21 @@ type ContextData struct {
 	Password string
 }
 
+func (s *SASLAuth) authTimeout() time.Duration {
+	if s.AuthTimeout > 0 {
+		return s.AuthTimeout
+	}
+	return DefaultAuthTimeout
+}
+
 // CreateSASL creates the sasl.Server instance for the corresponding mechanism.
+//
+// The successCb receives the ctx that bounds the authentication operation.
+// Implementations that need to perform additional work (e.g. opening a storage
+// account) should use this ctx to propagate cancellation.
 func (s *SASLAuth) CreateSASL(
 	mech string, remoteAddr net.Addr,
-	successCb func(identity string, data ContextData) error,
+	successCb func(ctx context.Context, identity string, data ContextData) error,
 ) sasl.Server {
 	switch mech {
 	case sasl.Plain:
@@ -151,7 +172,10 @@ func (s *SASLAuth) CreateSASL(
 				return ErrInvalidAuthCred
 			}
 
-			err := s.AuthPlain(username, password)
+			ctx, cancel := context.WithTimeout(context.Background(), s.authTimeout())
+			defer cancel()
+
+			err := s.AuthPlain(ctx, username, password)
 			if err != nil {
 				s.Log.Error("authentication failed", err, "username", username, "src_ip", remoteAddr)
 				if s.ErrorMap != nil {
@@ -160,7 +184,7 @@ func (s *SASLAuth) CreateSASL(
 				return ErrInvalidAuthCred
 			}
 
-			return successCb(identity, ContextData{
+			return successCb(ctx, identity, ContextData{
 				Username: username,
 				Password: password,
 			})
@@ -171,7 +195,10 @@ func (s *SASLAuth) CreateSASL(
 		}
 
 		return sasllogin.NewLoginServer(func(username, password string) error {
-			username, err := s.usernameForAuth(context.Background(), username)
+			ctx, cancel := context.WithTimeout(context.Background(), s.authTimeout())
+			defer cancel()
+
+			username, err := s.usernameForAuth(ctx, username)
 			if err != nil {
 				if s.ErrorMap != nil {
 					return s.ErrorMap(ErrInvalidAuthCred)
@@ -179,7 +206,7 @@ func (s *SASLAuth) CreateSASL(
 				return err
 			}
 
-			err = s.AuthPlain(username, password)
+			err = s.AuthPlain(ctx, username, password)
 			if err != nil {
 				s.Log.Error("authentication failed", err, "username", username, "src_ip", remoteAddr)
 				if s.ErrorMap != nil {
@@ -188,7 +215,7 @@ func (s *SASLAuth) CreateSASL(
 				return ErrInvalidAuthCred
 			}
 
-			return successCb(username, ContextData{
+			return successCb(ctx, username, ContextData{
 				Username: username,
 				Password: password,
 			})

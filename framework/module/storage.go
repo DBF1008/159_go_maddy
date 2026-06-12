@@ -19,6 +19,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package module
 
 import (
+	"context"
+
 	imapbackend "github.com/emersion/go-imap/backend"
 )
 
@@ -32,8 +34,8 @@ type Storage interface {
 	// the name.
 	//
 	// If it doesn't exists - it should be created.
-	GetOrCreateIMAPAcct(username string) (imapbackend.User, error)
-	GetIMAPAcct(username string) (imapbackend.User, error)
+	GetOrCreateIMAPAcct(ctx context.Context, username string) (imapbackend.User, error)
+	GetIMAPAcct(ctx context.Context, username string) (imapbackend.User, error)
 
 	// Extensions returns list of IMAP extensions supported by backend.
 	IMAPExtensions() []string
