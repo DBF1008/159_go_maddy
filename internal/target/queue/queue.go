@@ -681,44 +681,68 @@ func (q *Queue) readDiskQueue() error {
 		return err
 	}
 
-	// TODO(GH #209): Rewrite this function to pass all sub-tests in TestQueueDelivery_DeserializationCleanUp/NoMeta.
-
-	loadedCount := 0
+	// A complete queued message consists of three files: ID.meta, ID.header
+	// and ID.body. The process may have been stopped/crashed while only some
+	// of these files were present on disk (e.g. in the middle of writing a new
+	// message or removing a delivered one). Such a message cannot be recovered,
+	// and the leftover files are orphans that would otherwise accumulate in the
+	// queue directory forever and skew retry statistics and operational state.
+	//
+	// We therefore first group all queue files by message ID and then decide,
+	// per message, whether it is complete (load it) or incomplete (remove
+	// whatever files remain). Unlike scanning only .meta files, this also
+	// detects messages whose .meta file is the one that went missing.
+	type msgFiles struct {
+		meta, header, body bool
+	}
+	messages := map[string]*msgFiles{}
+	fileFor := func(id string) *msgFiles {
+		files := messages[id]
+		if files == nil {
+			files = &msgFiles{}
+			messages[id] = files
+		}
+		return files
+	}
 	for _, entry := range dirInfo {
-		// We start loading from meta-data files and then check whether ID.header and ID.body exist.
-		// This allows us to properly detect dangling body files.
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta") {
+		if entry.IsDir() {
 			continue
 		}
-		id := entry.Name()[:len(entry.Name())-5]
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, ".meta"):
+			fileFor(name[:len(name)-len(".meta")]).meta = true
+		case strings.HasSuffix(name, ".header"):
+			fileFor(name[:len(name)-len(".header")]).header = true
+		case strings.HasSuffix(name, ".body"):
+			fileFor(name[:len(name)-len(".body")]).body = true
+		default:
+			// Ignore unrelated files such as ID.meta.new (interrupted metadata
+			// update) or ID.meta_broken (message marked as broken).
+		}
+	}
+
+	loadedCount := 0
+	for id, files := range messages {
+		// Incomplete message: at least one of the three files is missing.
+		// Remove whatever files remain so they don't pile up, and skip loading.
+		if !files.meta || !files.header || !files.body {
+			if files.meta {
+				q.tryRemoveDanglingFile(id + ".meta")
+			}
+			if files.header {
+				q.tryRemoveDanglingFile(id + ".header")
+			}
+			if files.body {
+				q.tryRemoveDanglingFile(id + ".body")
+			}
+			q.log.Printf("incomplete message, removed dangling files (msg ID = %s)", id)
+			continue
+		}
 
 		meta, err := q.readMessageMeta(id)
 		if err != nil {
 			q.log.Printf("failed to read meta-data, skipping: %v (msg ID = %s)", err, id)
-			continue
-		}
-
-		// Check header file existence.
-		if _, err := os.Stat(filepath.Join(q.location, id+".header")); err != nil {
-			if os.IsNotExist(err) {
-				q.log.Printf("header file doesn't exist for msg ID = %s", id)
-				q.tryRemoveDanglingFile(id + ".meta")
-				q.tryRemoveDanglingFile(id + ".body")
-			} else {
-				q.log.Printf("skipping nonstat'able header file: %v (msg ID = %s)", err, id)
-			}
-			continue
-		}
-
-		// Check body file existence.
-		if _, err := os.Stat(filepath.Join(q.location, id+".body")); err != nil {
-			if os.IsNotExist(err) {
-				q.log.Printf("body file doesn't exist for msg ID = %s", id)
-				q.tryRemoveDanglingFile(id + ".meta")
-				q.tryRemoveDanglingFile(id + ".header")
-			} else {
-				q.log.Printf("skipping nonstat'able body file: %v (msg ID = %s)", err, id)
-			}
 			continue
 		}
 

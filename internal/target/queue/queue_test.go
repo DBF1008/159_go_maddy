@@ -552,7 +552,6 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	}
 
 	t.Run("NoMeta", func(t *testing.T) {
-		t.Skip("Not implemented")
 		test(t, ".meta")
 	})
 	t.Run("NoBody", func(t *testing.T) {
@@ -561,6 +560,66 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	t.Run("NoHeader", func(t *testing.T) {
 		test(t, ".header")
 	})
+}
+
+// TestQueueDelivery_OrphanCleanupKeepsOthers ensures that an incomplete message
+// left on disk (here: .meta lost while .header and .body remain) is cleaned up
+// on load without disturbing the recovery of an unrelated, fully persisted
+// message.
+func TestQueueDelivery_OrphanCleanupKeepsOthers(t *testing.T) {
+	t.Parallel()
+
+	dt := unreliableTarget{
+		rcptFailures: []map[string]error{
+			{
+				"tester1@example.org": exterrors.WithTemporary(errors.New("go away"), true),
+			},
+		},
+		committed: make(chan testutils.Msg, 10),
+	}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	// Same rationale as TestQueueDelivery_SerializationRoundtrip: increase the
+	// retry delay so we reliably stop the queue before it retries on its own.
+	q.initialRetryTime = 1 * time.Second
+	q.postInitDelay = 0
+
+	// A valid message: delivery succeeds for tester2 but temporarily fails for
+	// tester1, so the message is persisted on disk for a later retry.
+	deliveryID := testutils.DoTestDelivery(t, q, "tester@example.com", []string{"tester1@example.org", "tester2@example.org"})
+	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
+	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
+
+	require.NoError(t, q.Stop())
+
+	// The valid message must be fully persisted (meta + header + body).
+	checkQueueDir(t, q, []string{deliveryID})
+
+	// Simulate a message whose .meta file was lost while .header and .body
+	// remained on disk (e.g. a crash/restart mid-removal). Its ID differs from
+	// the valid message above.
+	orphanRaw := sha1.Sum([]byte("orphan-" + t.Name()))
+	orphanID := hex.EncodeToString(orphanRaw[:])
+	for _, suffix := range []string{".header", ".body"} {
+		if err := os.WriteFile(filepath.Join(q.location, orphanID+suffix), []byte("orphan\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Restart: readDiskQueue should recover the valid message and clean up the
+	// orphan's leftover files. newTestQueueDir resets retry delays to 0, so the
+	// recovered message is retried promptly.
+	q = newTestQueueDir(t, &dt, q.location)
+
+	// The recovered message's retry now succeeds for tester1.
+	msg = readMsgChanTimeout(t, dt.committed, 5*time.Second)
+	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester1@example.org"}, "")
+
+	require.NoError(t, q.Stop())
+
+	// Both the (now delivered) valid message and the orphan files are gone.
+	checkQueueDir(t, q, []string{})
 }
 
 func TestQueueDelivery_AbortIfNoRecipients(t *testing.T) {
