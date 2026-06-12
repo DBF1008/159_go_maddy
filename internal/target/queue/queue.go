@@ -681,9 +681,8 @@ func (q *Queue) readDiskQueue() error {
 		return err
 	}
 
-	// TODO(GH #209): Rewrite this function to pass all sub-tests in TestQueueDelivery_DeserializationCleanUp/NoMeta.
-
 	loadedCount := 0
+	metaIDs := make(map[string]bool)
 	for _, entry := range dirInfo {
 		// We start loading from meta-data files and then check whether ID.header and ID.body exist.
 		// This allows us to properly detect dangling body files.
@@ -691,6 +690,7 @@ func (q *Queue) readDiskQueue() error {
 			continue
 		}
 		id := entry.Name()[:len(entry.Name())-5]
+		metaIDs[id] = true
 
 		meta, err := q.readMessageMeta(id)
 		if err != nil {
@@ -747,6 +747,29 @@ func (q *Queue) readDiskQueue() error {
 
 	if loadedCount != 0 {
 		q.log.Printf("loaded %d saved queue entries", loadedCount)
+	}
+
+	// Second pass: clean up orphaned .header and .body files that have no
+	// corresponding .meta file. This handles the case where .meta was lost
+	// (e.g. process crash during cleanup) but .header/.body remain.
+	for _, entry := range dirInfo {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		var suffix string
+		if strings.HasSuffix(name, ".header") {
+			suffix = ".header"
+		} else if strings.HasSuffix(name, ".body") {
+			suffix = ".body"
+		} else {
+			continue
+		}
+		id := name[:len(name)-len(suffix)]
+		if !metaIDs[id] {
+			q.log.Printf("found orphan file without meta-data: %s", name)
+			q.tryRemoveDanglingFile(name)
+		}
 	}
 
 	return nil
@@ -927,6 +950,7 @@ func (q *Queue) openMessage(id string) (*QueueMetadata, textproto.Header, buffer
 		}
 		return nil, textproto.Header{}, nil, err
 	}
+	defer headerFile.Close()
 
 	bufferedHeader := bufio.NewReader(headerFile)
 	header, err := textproto.ReadHeader(bufferedHeader)

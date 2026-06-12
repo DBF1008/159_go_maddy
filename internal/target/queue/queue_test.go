@@ -125,6 +125,7 @@ func (utd *unreliableTargetDelivery) Body(ctx context.Context, header textproto.
 	}
 
 	r, _ := body.Open()
+	defer r.Close()
 	utd.msg.Body, _ = io.ReadAll(r)
 
 	if len(utd.ut.bodyFailures) > utd.ut.passedMessages {
@@ -136,6 +137,7 @@ func (utd *unreliableTargetDelivery) Body(ctx context.Context, header textproto.
 
 func (utd *unreliableTargetDeliveryPartial) BodyNonAtomic(ctx context.Context, c module.StatusCollector, header textproto.Header, body buffer.Buffer) {
 	r, _ := body.Open()
+	defer r.Close()
 	utd.msg.Body, _ = io.ReadAll(r)
 
 	if len(utd.ut.bodyFailuresPartial) > utd.ut.passedMessages {
@@ -552,7 +554,6 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	}
 
 	t.Run("NoMeta", func(t *testing.T) {
-		t.Skip("Not implemented")
 		test(t, ".meta")
 	})
 	t.Run("NoBody", func(t *testing.T) {
@@ -560,6 +561,96 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	})
 	t.Run("NoHeader", func(t *testing.T) {
 		test(t, ".header")
+	})
+}
+
+// TestQueueDelivery_OrphanFilesCleanUp verifies that orphaned .header and
+// .body files (those without a matching .meta) are cleaned up on startup
+// without disturbing valid queued messages.
+func TestQueueDelivery_OrphanFilesCleanUp(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OrphanHeaderOnly", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		// Plant an orphan .header file (no .meta, no .body).
+		orphanID := "deadbeef00000000"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, orphanID+".header"), []byte("From: orphan\r\n\r\n"), 0o644))
+
+		dt := unreliableTarget{committed: make(chan testutils.Msg, 10)}
+		q := newTestQueueDir(t, &dt, dir)
+		defer cleanQueue(t, q)
+
+		checkQueueDir(t, q, []string{})
+	})
+
+	t.Run("OrphanBodyOnly", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		// Plant an orphan .body file (no .meta, no .header).
+		orphanID := "cafebabe11111111"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, orphanID+".body"), []byte("orphan body\r\n"), 0o644))
+
+		dt := unreliableTarget{committed: make(chan testutils.Msg, 10)}
+		q := newTestQueueDir(t, &dt, dir)
+		defer cleanQueue(t, q)
+
+		checkQueueDir(t, q, []string{})
+	})
+
+	t.Run("OrphanHeaderAndBody", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		// Plant an orphan .header + .body pair (no .meta).
+		orphanID := "face1234abcd5678"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, orphanID+".header"), []byte("From: orphan\r\n\r\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, orphanID+".body"), []byte("orphan body\r\n"), 0o644))
+
+		dt := unreliableTarget{committed: make(chan testutils.Msg, 10)}
+		q := newTestQueueDir(t, &dt, dir)
+		defer cleanQueue(t, q)
+
+		checkQueueDir(t, q, []string{})
+	})
+
+	t.Run("OrphanCoexistsWithValid", func(t *testing.T) {
+		t.Parallel()
+
+		dt := unreliableTarget{
+			// Two entries: one for the initial delivery, one for the retry
+			// that fires during reload. Both must fail for tester1 to keep
+			// the message on disk until we can verify it.
+			rcptFailures: []map[string]error{
+				{
+					"tester1@example.org": exterrors.WithTemporary(errors.New("go away"), true),
+				},
+				{
+					"tester1@example.org": exterrors.WithTemporary(errors.New("go away"), true),
+				},
+			},
+			committed: make(chan testutils.Msg, 10),
+		}
+		q := newTestQueue(t, &dt)
+		defer cleanQueue(t, q)
+
+		q.initialRetryTime = 1 * time.Second
+		q.postInitDelay = 0
+
+		// Create a real queued message that should survive reload.
+		deliveryID := testutils.DoTestDelivery(t, q, "tester@example.com", []string{"tester1@example.org", "tester2@example.org"})
+		readMsgChanTimeout(t, dt.committed, 5*time.Second)
+		require.NoError(t, q.Stop())
+
+		// Plant orphan files alongside the valid message.
+		orphanID := "9999aaaa0000bbbb"
+		require.NoError(t, os.WriteFile(filepath.Join(q.location, orphanID+".header"), []byte("From: orphan\r\n\r\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(q.location, orphanID+".body"), []byte("orphan body\r\n"), 0o644))
+
+		// Reload: orphans must be cleaned, valid message must be preserved.
+		q = newTestQueueDir(t, &dt, q.location)
+		require.NoError(t, q.Stop())
+
+		checkQueueDir(t, q, []string{deliveryID})
 	})
 }
 
