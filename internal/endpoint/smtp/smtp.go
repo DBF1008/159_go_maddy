@@ -400,10 +400,10 @@ func (endp *Endpoint) NewSession(conn *smtp.Conn) (smtp.Session, error) {
 
 func (endp *Endpoint) newSession(conn *smtp.Conn) *Session {
 	s := &Session{
-		endp:       endp,
-		log:        endp.log,
-		sessionCtx: context.Background(),
+		endp: endp,
+		log:  endp.log,
 	}
+	s.sessionCtx, s.cancelSession = context.WithCancel(context.Background())
 
 	// Used in tests.
 	if conn == nil {

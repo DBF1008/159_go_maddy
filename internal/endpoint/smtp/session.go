@@ -74,8 +74,10 @@ type Session struct {
 	endp *Endpoint
 
 	// Specific for this session.
-	// sessionCtx is not used for cancellation or timeouts, only for tracing.
+	// sessionCtx is cancelled when the session ends (see Logout) and serves as
+	// the parent context for per-message tracing.
 	sessionCtx       context.Context
+	cancelSession    func()
 	cancelRDNS       func()
 	connState        module.ConnState
 	repeatedMailErrs int
@@ -103,7 +105,7 @@ func (s *Session) AuthMechanisms() []string {
 }
 
 func (s *Session) Auth(mech string) (sasl.Server, error) {
-	return s.endp.saslAuth.CreateSASL(mech, s.connState.RemoteAddr, func(identity string, data auth.ContextData) error {
+	return s.endp.saslAuth.CreateSASL(s.sessionCtx, mech, s.connState.RemoteAddr, func(identity string, data auth.ContextData) error {
 		s.connState.AuthUser = identity
 		s.connState.AuthPassword = data.Password
 		return nil
@@ -165,7 +167,7 @@ func (s *Session) AuthPlain(username, password string) error {
 	}
 
 	// saslAuth will handle AuthMap and AuthNormalize.
-	err := s.endp.saslAuth.AuthPlain(username, password)
+	err := s.endp.saslAuth.AuthPlain(s.sessionCtx, username, password)
 	if err != nil {
 		s.endp.log.Error("authentication failed", err, "username", username, "src_ip", s.connState.RemoteAddr)
 
@@ -410,6 +412,9 @@ func (s *Session) Logout() error {
 	}
 	if s.cancelRDNS != nil {
 		s.cancelRDNS()
+	}
+	if s.cancelSession != nil {
+		s.cancelSession()
 	}
 
 	s.endp.sessionCnt.Add(-1)

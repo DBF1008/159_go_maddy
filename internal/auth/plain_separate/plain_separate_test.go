@@ -35,7 +35,7 @@ func (mockAuth) SASLMechanisms() []string {
 	return []string{sasl.Plain, sasl.Login}
 }
 
-func (m mockAuth) AuthPlain(username, _ string) error {
+func (m mockAuth) AuthPlain(_ context.Context, username, _ string) error {
 	ok := m.db[username]
 	if !ok {
 		return errors.New("invalid creds")

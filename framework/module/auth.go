@@ -18,7 +18,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 package module
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // ErrUnknownCredentials should be returned by auth. provider if supplied
 // credentials are valid for it but are not recognized (e.g. not found in
@@ -30,7 +33,7 @@ var ErrUnknownCredentials = errors.New("unknown credentials")
 //
 // Modules implementing this interface should be registered with "auth." prefix in name.
 type PlainAuth interface {
-	AuthPlain(username, password string) error
+	AuthPlain(ctx context.Context, username, password string) error
 }
 
 // PlainUserDB is a local credentials store that can be managed using maddy command

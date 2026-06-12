@@ -145,8 +145,11 @@ func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 
 	for _, mech := range endp.saslAuth.SASLMechanisms() {
 		endp.serv.EnableAuth(mech, func(c imapserver.Conn) sasl.Server {
-			return endp.saslAuth.CreateSASL(mech, c.Info().RemoteAddr, func(identity string, data auth.ContextData) error {
-				return endp.openAccount(c, identity)
+			// go-imap v1 does not expose a per-connection context.Context, so
+			// the auth/storage chain cannot observe a raw TCP disconnect here.
+			ctx := context.Background()
+			return endp.saslAuth.CreateSASL(ctx, mech, c.Info().RemoteAddr, func(identity string, data auth.ContextData) error {
+				return endp.openAccount(ctx, c, identity)
 			})
 		})
 	}
@@ -258,8 +261,8 @@ func (endp *Endpoint) usernameForStorage(ctx context.Context, saslUsername strin
 	return mapped, nil
 }
 
-func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
-	username, err := endp.usernameForStorage(context.TODO(), identity)
+func (endp *Endpoint) openAccount(ctx context.Context, c imapserver.Conn, identity string) error {
+	username, err := endp.usernameForStorage(ctx, identity)
 	if err != nil {
 		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
 			return err
@@ -268,25 +271,29 @@ func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
 		return fmt.Errorf("internal server error")
 	}
 
-	u, err := endp.Store.GetOrCreateIMAPAcct(username)
+	u, err := endp.Store.GetOrCreateIMAPAcct(ctx, username)
 	if err != nil {
 		return err
 	}
-	ctx := c.Context()
-	ctx.State = imap.AuthenticatedState
-	ctx.User = u
+	imapCtx := c.Context()
+	imapCtx.State = imap.AuthenticatedState
+	imapCtx.User = u
 	return nil
 }
 
 func (endp *Endpoint) Login(connInfo *imap.ConnInfo, username, password string) (imapbackend.User, error) {
+	// go-imap v1 does not expose a per-connection context.Context for the LOGIN
+	// command, so cancellation on raw TCP disconnect is not observable here.
+	ctx := context.Background()
+
 	// saslAuth handles AuthMap calling.
-	err := endp.saslAuth.AuthPlain(username, password)
+	err := endp.saslAuth.AuthPlain(ctx, username, password)
 	if err != nil {
 		endp.log.Error("authentication failed", err, "username", username, "src_ip", connInfo.RemoteAddr)
 		return nil, imapbackend.ErrInvalidCredentials
 	}
 
-	storageUsername, err := endp.usernameForStorage(context.TODO(), username)
+	storageUsername, err := endp.usernameForStorage(ctx, username)
 	if err != nil {
 		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
 			return nil, err
@@ -295,7 +302,7 @@ func (endp *Endpoint) Login(connInfo *imap.ConnInfo, username, password string) 
 		return nil, fmt.Errorf("internal server error")
 	}
 
-	return endp.Store.GetOrCreateIMAPAcct(storageUsername)
+	return endp.Store.GetOrCreateIMAPAcct(ctx, storageUsername)
 }
 
 func (endp *Endpoint) I18NLevel() int {

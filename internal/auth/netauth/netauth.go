@@ -82,7 +82,7 @@ func (a *Auth) Lookup(ctx context.Context, username string) (string, bool, error
 	}
 
 	if a.mustGroup != "" {
-		if err := a.checkMustGroup(username); err != nil {
+		if err := a.checkMustGroup(ctx, username); err != nil {
 			return "", false, err
 		}
 	}
@@ -91,23 +91,23 @@ func (a *Auth) Lookup(ctx context.Context, username string) (string, bool, error
 
 // AuthPlain attempts straightforward authentication of the entity on
 // the remote NetAuth server.
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(ctx context.Context, username, password string) error {
 	a.log.Debugf("attempting to auth user: %s", username)
-	if err := a.nacl.AuthEntity(context.Background(), username, password); err != nil {
+	if err := a.nacl.AuthEntity(ctx, username, password); err != nil {
 		return module.ErrUnknownCredentials
 	}
 	a.log.Debugln("netauth returns successful auth")
 	if a.mustGroup != "" {
-		if err := a.checkMustGroup(username); err != nil {
+		if err := a.checkMustGroup(ctx, username); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (a *Auth) checkMustGroup(username string) error {
+func (a *Auth) checkMustGroup(ctx context.Context, username string) error {
 	a.log.Debugf("Performing require_group check: must=%s", a.mustGroup)
-	groups, err := a.nacl.EntityGroups(context.Background(), username)
+	groups, err := a.nacl.EntityGroups(ctx, username)
 	if err != nil {
 		return fmt.Errorf("%s: groups: %w", modName, err)
 	}

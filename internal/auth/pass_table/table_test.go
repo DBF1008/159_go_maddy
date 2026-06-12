@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package pass_table
 
 import (
+	"context"
 	"testing"
 
 	"github.com/foxcpp/maddy/framework/config"

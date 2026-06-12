@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package dovecotsasld
 
 import (
+	"context"
 	"fmt"
 	stdlog "log"
 	"net"
@@ -92,7 +93,9 @@ func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 				remoteAddr = &net.TCPAddr{IP: req.RemoteIP, Port: int(req.RemotePort)}
 			}
 
-			return endp.saslAuth.CreateSASL(mech, remoteAddr, func(_ string, _ auth.ContextData) error { return nil })
+			// dovecot SASL provides AuthReq, not a Go context.Context, so the
+			// auth chain cannot observe cancellation here; use a background context.
+			return endp.saslAuth.CreateSASL(context.Background(), mech, remoteAddr, func(_ string, _ auth.ContextData) error { return nil })
 		})
 	}
 

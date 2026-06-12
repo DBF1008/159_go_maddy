@@ -73,13 +73,13 @@ func (a *Auth) Lookup(ctx context.Context, username string) (string, bool, error
 	return a.table.Lookup(ctx, key)
 }
 
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(ctx context.Context, username, password string) error {
 	key, err := precis.UsernameCaseMapped.CompareKey(username)
 	if err != nil {
 		return err
 	}
 
-	hash, ok, err := a.table.Lookup(context.TODO(), key)
+	hash, ok, err := a.table.Lookup(ctx, key)
 	if !ok {
 		return module.ErrUnknownCredentials
 	}

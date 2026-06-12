@@ -114,10 +114,10 @@ func (a *Auth) Lookup(ctx context.Context, username string) (string, bool, error
 	return "", true, nil
 }
 
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(ctx context.Context, username, password string) error {
 	ok := len(a.userTbls) == 0
 	for _, tbl := range a.userTbls {
-		_, tblOk, err := tbl.Lookup(context.TODO(), username)
+		_, tblOk, err := tbl.Lookup(ctx, username)
 		if err != nil {
 			return err
 		}
@@ -132,7 +132,7 @@ func (a *Auth) AuthPlain(username, password string) error {
 
 	var lastErr error
 	for _, p := range a.passwd {
-		if err := p.AuthPlain(username, password); err != nil {
+		if err := p.AuthPlain(ctx, username, password); err != nil {
 			lastErr = err
 			continue
 		}

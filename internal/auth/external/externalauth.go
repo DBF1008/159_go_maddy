@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package external
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -91,7 +92,7 @@ func (ea *ExternalAuth) Configure(inlineArgs []string, cfg *config.Map) error {
 	return nil
 }
 
-func (ea *ExternalAuth) AuthPlain(username, password string) error {
+func (ea *ExternalAuth) AuthPlain(_ context.Context, username, password string) error {
 	accountName, ok := auth.CheckDomainAuth(username, ea.perDomain, ea.domains)
 	if !ok {
 		return module.ErrUnknownCredentials

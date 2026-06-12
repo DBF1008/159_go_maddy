@@ -100,23 +100,24 @@ func (s *SASLAuth) usernameForAuth(ctx context.Context, saslUsername string) (st
 	return mapped, nil
 }
 
-func (s *SASLAuth) AuthPlain(username, password string) error {
+func (s *SASLAuth) AuthPlain(ctx context.Context, username, password string) error {
 	if len(s.Plain) == 0 {
 		return ErrUnsupportedMech
 	}
 
+	// Resolve the alias mapping once per login, not once per provider.
+	mappedUsername, err := s.usernameForAuth(ctx, username)
+	if err != nil {
+		return err
+	}
+
 	var lastErr error
 	for _, p := range s.Plain {
-		mappedUsername, err := s.usernameForAuth(context.TODO(), username)
-		if err != nil {
-			return err
-		}
-
 		s.Log.DebugMsg("attempting authentication",
 			"mapped_username", mappedUsername, "original_username", username,
 			"module", p)
 
-		lastErr = p.AuthPlain(mappedUsername, password)
+		lastErr = p.AuthPlain(ctx, mappedUsername, password)
 		if lastErr == nil {
 			return nil
 		}
@@ -135,7 +136,7 @@ type ContextData struct {
 
 // CreateSASL creates the sasl.Server instance for the corresponding mechanism.
 func (s *SASLAuth) CreateSASL(
-	mech string, remoteAddr net.Addr,
+	ctx context.Context, mech string, remoteAddr net.Addr,
 	successCb func(identity string, data ContextData) error,
 ) sasl.Server {
 	switch mech {
@@ -151,7 +152,7 @@ func (s *SASLAuth) CreateSASL(
 				return ErrInvalidAuthCred
 			}
 
-			err := s.AuthPlain(username, password)
+			err := s.AuthPlain(ctx, username, password)
 			if err != nil {
 				s.Log.Error("authentication failed", err, "username", username, "src_ip", remoteAddr)
 				if s.ErrorMap != nil {
@@ -171,7 +172,7 @@ func (s *SASLAuth) CreateSASL(
 		}
 
 		return sasllogin.NewLoginServer(func(username, password string) error {
-			username, err := s.usernameForAuth(context.Background(), username)
+			username, err := s.usernameForAuth(ctx, username)
 			if err != nil {
 				if s.ErrorMap != nil {
 					return s.ErrorMap(ErrInvalidAuthCred)
@@ -179,7 +180,7 @@ func (s *SASLAuth) CreateSASL(
 				return err
 			}
 
-			err = s.AuthPlain(username, password)
+			err = s.AuthPlain(ctx, username, password)
 			if err != nil {
 				s.Log.Error("authentication failed", err, "username", username, "src_ip", remoteAddr)
 				if s.ErrorMap != nil {

@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package pam
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -79,7 +80,7 @@ func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
 	return nil
 }
 
-func (a *Auth) AuthPlain(username, password string) error {
+func (a *Auth) AuthPlain(_ context.Context, username, password string) error {
 	if a.useHelper {
 		if err := external.AuthUsingHelper(a.helperPath, username, password); err != nil {
 			return err

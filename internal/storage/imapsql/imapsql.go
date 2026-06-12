@@ -401,8 +401,8 @@ func (store *Storage) CreateMessageLimit() *uint32 {
 	return store.Back.CreateMessageLimit()
 }
 
-func (store *Storage) GetOrCreateIMAPAcct(username string) (backend.User, error) {
-	accountName, err := store.authNormalize(context.TODO(), username)
+func (store *Storage) GetOrCreateIMAPAcct(ctx context.Context, username string) (backend.User, error) {
+	accountName, err := store.authNormalize(ctx, username)
 	if err != nil {
 		return nil, backend.ErrInvalidCredentials
 	}
