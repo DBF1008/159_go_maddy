@@ -1,0 +1,164 @@
+/*
+Maddy Mail Server - Composable all-in-one email server.
+Copyright © 2019-2025 Max Mazurov <fox.cpp@disroot.org>, Maddy Mail Server contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+package container
+
+import (
+	"fmt"
+
+	"github.com/foxcpp/maddy/framework/log"
+	"github.com/foxcpp/maddy/framework/module"
+)
+
+// LifetimeModule is a stateful module that needs to have post-configuration
+// startup and graceful shutdown functionality.
+type LifetimeModule interface {
+	module.Module
+	Start() error
+	Stop() error
+}
+
+type ReloadModule interface {
+	module.Module
+	Reload() error
+}
+
+// EarlyStopModule is a LifetimeModule that needs to do some bookkeeping
+// before new server instance starts during reload.
+type EarlyStopModule interface {
+	LifetimeModule
+	EarlyStop() error
+}
+
+type LifetimeTracker struct {
+	logger    *log.Logger
+	instances []*struct {
+		mod          LifetimeModule
+		started      bool
+		earlyStopped bool
+	}
+}
+
+func (lt *LifetimeTracker) Add(mod LifetimeModule) {
+	lt.instances = append(lt.instances, &struct {
+		mod          LifetimeModule
+		started      bool
+		earlyStopped bool
+	}{mod: mod, started: false})
+}
+
+// StartAll calls Start for all registered LifetimeModule instances.
+func (lt *LifetimeTracker) StartAll() error {
+	for _, entry := range lt.instances {
+		if entry.started {
+			continue
+		}
+
+		lt.logger.DebugMsg("starting module",
+			"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+
+		if err := entry.mod.Start(); err != nil {
+			if err := lt.StopAll(); err != nil {
+				lt.logger.Error("StopAll failed after Start fail", err)
+			}
+			return fmt.Errorf("failed to start module %v: %w",
+				entry.mod.InstanceName(), err)
+		}
+		lt.logger.DebugMsg("module started",
+			"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+		entry.started = true
+	}
+	return nil
+}
+
+func (lt *LifetimeTracker) ReloadAll() error {
+	for _, entry := range lt.instances {
+		if !entry.started {
+			continue
+		}
+
+		rm, ok := entry.mod.(ReloadModule)
+		if !ok {
+			continue
+		}
+
+		if err := rm.Reload(); err != nil {
+			lt.logger.Error("module reload failed", err,
+				"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+			continue
+		}
+
+		lt.logger.DebugMsg("module reloaded",
+			"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+	}
+	return nil
+}
+
+func (lt *LifetimeTracker) EarlyStopAll() error {
+	for i := len(lt.instances) - 1; i >= 0; i-- {
+		entry := lt.instances[i]
+
+		if !entry.started {
+			continue
+		}
+
+		rsm, ok := entry.mod.(EarlyStopModule)
+		if !ok {
+			continue
+		}
+
+		if err := rsm.EarlyStop(); err != nil {
+			lt.logger.Error("module early stop failed", err,
+				"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+			continue
+		}
+		lt.logger.DebugMsg("module early stopped",
+			"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+
+		entry.earlyStopped = true
+	}
+	return nil
+}
+
+// StopAll calls Stop for all registered LifetimeModule instances.
+func (lt *LifetimeTracker) StopAll() error {
+	for i := len(lt.instances) - 1; i >= 0; i-- {
+		entry := lt.instances[i]
+
+		if !entry.started {
+			continue
+		}
+
+		if err := entry.mod.Stop(); err != nil {
+			lt.logger.Error("module stop failed", err,
+				"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+			continue
+		}
+		lt.logger.DebugMsg("module stopped",
+			"mod_name", entry.mod.Name(), "inst_name", entry.mod.InstanceName())
+
+		entry.started = false
+	}
+	return nil
+}
+
+func NewLifetime(log *log.Logger) *LifetimeTracker {
+	return &LifetimeTracker{
+		logger: log,
+	}
+}

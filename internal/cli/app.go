@@ -1,0 +1,108 @@
+package maddycli
+
+import (
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/foxcpp/maddy/framework/log"
+	"github.com/urfave/cli/v2"
+)
+
+var app *cli.App
+
+func init() {
+	app = cli.NewApp()
+	app.Usage = "composable all-in-one mail server"
+	app.Description = `Maddy is Mail Transfer agent (MTA), Mail Delivery Agent (MDA), Mail Submission
+Agent (MSA), IMAP server and a set of other essential protocols/schemes
+necessary to run secure email server implemented in one executable.
+
+This executable can be used to start the server ('run') and to manipulate
+databases used by it (all other subcommands).
+`
+	app.Authors = []*cli.Author{
+		{
+			Name:  "Maddy Mail Server maintainers & contributors",
+			Email: "~foxcpp/maddy@lists.sr.ht",
+		},
+	}
+	app.ExitErrHandler = func(c *cli.Context, err error) {
+		if err == nil {
+			return
+		}
+
+		var exitErr cli.ExitCoder
+		if errors.As(err, &exitErr) {
+			if err.Error() != "" {
+				if _, ok := exitErr.(cli.ErrorFormatter); ok {
+					_, _ = fmt.Fprintf(os.Stderr, "Error: %+v\n", err)
+				} else {
+					_, _ = fmt.Fprintln(os.Stderr, "Error:", err)
+				}
+			}
+			cli.OsExiter(exitErr.ExitCode())
+			return
+		}
+	}
+	app.EnableBashCompletion = true
+	app.Commands = []*cli.Command{
+		{
+			Name:   "generate-man",
+			Hidden: true,
+			Action: func(c *cli.Context) error {
+				man, err := app.ToMan()
+				if err != nil {
+					return err
+				}
+				fmt.Println(man)
+				return nil
+			},
+		},
+		{
+			Name:   "generate-fish-completion",
+			Hidden: true,
+			Action: func(c *cli.Context) error {
+				cp, err := app.ToFishCompletion()
+				if err != nil {
+					return err
+				}
+				fmt.Println(cp)
+				return nil
+			},
+		},
+	}
+}
+
+func AddGlobalFlag(f cli.Flag) {
+	app.Flags = append(app.Flags, f)
+}
+
+func AddSubcommand(cmd *cli.Command) {
+	app.Commands = append(app.Commands, cmd)
+}
+
+// RunWithoutExit is like Run but returns exit code instead of calling os.Exit
+// To be used in maddy.cover.
+func RunWithoutExit() int {
+	code := 0
+
+	cli.OsExiter = func(c int) { code = c }
+	defer func() {
+		cli.OsExiter = os.Exit
+	}()
+
+	Run()
+
+	return code
+}
+
+func Run() {
+	mapStdlibFlags(app)
+
+	// Actual entry point is registered in maddy.go.
+
+	if err := app.Run(os.Args); err != nil {
+		log.DefaultLogger.Error("app.Run failed", err)
+	}
+}

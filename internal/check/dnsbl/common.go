@@ -1,0 +1,280 @@
+/*
+Maddy Mail Server - Composable all-in-one email server.
+Copyright © 2019-2020 Max Mazurov <fox.cpp@disroot.org>, Maddy Mail Server contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+package dnsbl
+
+import (
+	"context"
+	"net"
+	"strconv"
+	"strings"
+
+	"github.com/foxcpp/maddy/framework/dns"
+	"github.com/foxcpp/maddy/framework/exterrors"
+)
+
+type ListedErr struct {
+	Identity string
+	List     string
+	Reason   string
+	Score    int
+	Message  string
+}
+
+func (le ListedErr) Fields() map[string]interface{} {
+	msg := "Client identity listed in the used DNSBL"
+	if le.Message != "" {
+		msg = le.Message
+	}
+	return map[string]interface{}{
+		"check":           "dnsbl",
+		"list":            le.List,
+		"listed_identity": le.Identity,
+		"reason":          le.Reason,
+		"smtp_code":       554,
+		"smtp_enchcode":   exterrors.EnhancedCode{5, 7, 0},
+		"smtp_msg":        msg,
+	}
+}
+
+func (le ListedErr) Error() string {
+	return le.Identity + " is listed in the used DNSBL"
+}
+
+func checkDomain(ctx context.Context, resolver dns.Resolver, cfg List, domain string) error {
+	query := domain + "." + cfg.Zone
+
+	addrs, err := resolver.LookupHost(ctx, query)
+	if err != nil {
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+			return nil
+		}
+
+		return err
+	}
+
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	var score int
+	var customMessage string
+	var filteredAddrs []string
+
+	// If ResponseRules is configured, use new behavior
+	if len(cfg.ResponseRules) > 0 {
+		// Convert string addresses to IPAddr for matching
+		ipAddrs := make([]net.IPAddr, 0, len(addrs))
+		for _, addr := range addrs {
+			if ip := net.ParseIP(addr); ip != nil {
+				ipAddrs = append(ipAddrs, net.IPAddr{IP: ip})
+			}
+		}
+
+		matchedScore, matchedMessages, matchedReasons, matched := matchResponseRules(ipAddrs, cfg.ResponseRules)
+		if !matched {
+			return nil
+		}
+		score = matchedScore
+
+		// Use first matched message if available
+		if len(matchedMessages) > 0 {
+			customMessage = matchedMessages[0]
+		}
+
+		filteredAddrs = matchedReasons
+	} else {
+		// Legacy behavior: accept all addresses
+		filteredAddrs = addrs
+	}
+
+	// Attempt to extract explanation string from TXT records (shared by both paths)
+	txts, err := resolver.LookupTXT(ctx, query)
+	var reason string
+	if err == nil && len(txts) > 0 {
+		reason = strings.Join(txts, "; ")
+	} else {
+		// Not significant, include addresses as reason. Usually they are
+		// mapped to some predefined 'reasons' by BL.
+		reason = strings.Join(filteredAddrs, "; ")
+	}
+
+	return ListedErr{
+		Identity: domain,
+		List:     cfg.Zone,
+		Reason:   reason,
+		Score:    score,
+		Message:  customMessage,
+	}
+}
+
+func matchResponseRules(addrs []net.IPAddr, rules []ResponseRule) (score int, messages []string, reasons []string, matched bool) {
+	// Track which rules have been matched to avoid counting the same rule multiple times
+	matchedRules := make(map[int]bool)
+
+	for _, addr := range addrs {
+		for ruleIdx, rule := range rules {
+			// Skip if this rule has already been matched
+			if matchedRules[ruleIdx] {
+				continue
+			}
+
+			for _, respNet := range rule.Networks {
+				if respNet.Contains(addr.IP) {
+					score += rule.Score
+					if rule.Message != "" {
+						messages = append(messages, rule.Message)
+					}
+					reasons = append(reasons, addr.IP.String())
+					matchedRules[ruleIdx] = true
+					matched = true
+					break // Move to next rule
+				}
+			}
+		}
+	}
+	return
+}
+
+func checkIP(ctx context.Context, resolver dns.Resolver, cfg List, ip net.IP) error {
+	ipv6 := true
+	if ipv4 := ip.To4(); ipv4 != nil {
+		ip = ipv4
+		ipv6 = false
+	}
+
+	if ipv6 && !cfg.ClientIPv6 {
+		return nil
+	}
+	if !ipv6 && !cfg.ClientIPv4 {
+		return nil
+	}
+
+	query := queryString(ip) + "." + cfg.Zone
+
+	addrs, err := resolver.LookupIPAddr(ctx, query)
+	if err != nil {
+		if dnsErr, ok := err.(*net.DNSError); ok && dnsErr.IsNotFound {
+			return nil
+		}
+
+		return err
+	}
+
+	var filteredAddrs []net.IPAddr
+	var score int
+	var customMessage string
+
+	// If ResponseRules is configured, use new behavior
+	if len(cfg.ResponseRules) > 0 {
+		matchedScore, matchedMessages, matchedReasons, matched := matchResponseRules(addrs, cfg.ResponseRules)
+		if !matched {
+			return nil
+		}
+		score = matchedScore
+
+		// Use first matched message if available
+		if len(matchedMessages) > 0 {
+			customMessage = matchedMessages[0]
+		}
+
+		// Build filteredAddrs from matched reasons for TXT lookup fallback
+		for _, reason := range matchedReasons {
+			filteredAddrs = append(filteredAddrs, net.IPAddr{IP: net.ParseIP(reason)})
+		}
+	} else {
+		// Legacy behavior: use flat Responses filter
+		filteredAddrs = make([]net.IPAddr, 0, len(addrs))
+	addrsLoop:
+		for _, addr := range addrs {
+			// No responses whitelist configured - permit all.
+			if len(cfg.Responses) == 0 {
+				filteredAddrs = append(filteredAddrs, addr)
+				continue
+			}
+
+			for _, respNet := range cfg.Responses {
+				if respNet.Contains(addr.IP) {
+					filteredAddrs = append(filteredAddrs, addr)
+					continue addrsLoop
+				}
+			}
+		}
+
+		if len(filteredAddrs) == 0 {
+			return nil
+		}
+	}
+
+	// Attempt to extract explanation string from TXT records (shared by both paths)
+	txts, err := resolver.LookupTXT(ctx, query)
+	var reason string
+	if err == nil && len(txts) > 0 {
+		reason = strings.Join(txts, "; ")
+	} else {
+		// Not significant, include addresses as reason. Usually they are
+		// mapped to some predefined 'reasons' by BL.
+		reasonParts := make([]string, 0, len(filteredAddrs))
+		for _, addr := range filteredAddrs {
+			reasonParts = append(reasonParts, addr.IP.String())
+		}
+		reason = strings.Join(reasonParts, "; ")
+	}
+
+	return ListedErr{
+		Identity: ip.String(),
+		List:     cfg.Zone,
+		Reason:   reason,
+		Score:    score,
+		Message:  customMessage,
+	}
+}
+
+func queryString(ip net.IP) string {
+	ipv6 := true
+	if ipv4 := ip.To4(); ipv4 != nil {
+		ip = ipv4
+		ipv6 = false
+	}
+
+	res := strings.Builder{}
+	if ipv6 {
+		res.Grow(63) // 0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0
+	} else {
+		res.Grow(15) // 000.000.000.000
+	}
+
+	for i := len(ip) - 1; i >= 0; i-- {
+		octet := ip[i]
+
+		if ipv6 {
+			// X.X
+			res.WriteString(strconv.FormatInt(int64(octet&0xf), 16))
+			res.WriteRune('.')
+			res.WriteString(strconv.FormatInt(int64((octet&0xf0)>>4), 16))
+		} else {
+			// X
+			res.WriteString(strconv.Itoa(int(octet)))
+		}
+
+		if i != 0 {
+			res.WriteRune('.')
+		}
+	}
+	return res.String()
+}

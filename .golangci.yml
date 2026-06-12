@@ -1,0 +1,25 @@
+version: "2"
+linters:
+  enable:
+  - errcheck
+  - staticcheck
+  - ineffassign
+  - govet
+  - unused
+  - prealloc
+  - unconvert
+  - misspell
+  - whitespace
+  - nakedret
+  - dogsled
+  - copyloopvar
+  - sqlclosecheck
+  - testifylint
+  - rowserrcheck
+  - recvcheck
+  settings:
+    errcheck:
+      disable-default-exclusions: false
+formatters:
+  enable:
+  - goimports
