@@ -107,7 +107,7 @@ type unreliableTargetDeliveryPartial struct {
 	*unreliableTargetDelivery
 }
 
-func (utd *unreliableTargetDelivery) AddRcpt(ctx context.Context, rcptTo string, _ smtp.RcptOptions) error {
+func (utd *unreliableTargetDelivery) AddRcpt(ctx context.Context, rcptTo string, opts smtp.RcptOptions) error {
 	if len(utd.ut.rcptFailures) > utd.ut.passedMessages {
 		rcptErrs := utd.ut.rcptFailures[utd.ut.passedMessages]
 		if err := rcptErrs[rcptTo]; err != nil {
@@ -116,6 +116,10 @@ func (utd *unreliableTargetDelivery) AddRcpt(ctx context.Context, rcptTo string,
 	}
 
 	utd.msg.RcptTo = append(utd.msg.RcptTo, rcptTo)
+	if utd.msg.RcptOpts == nil {
+		utd.msg.RcptOpts = make(map[string]smtp.RcptOptions)
+	}
+	utd.msg.RcptOpts[rcptTo] = opts
 	return nil
 }
 
@@ -505,6 +509,87 @@ func TestQueueDelivery_SerializationRoundtrip(t *testing.T) {
 	// Close it again.
 	require.NoError(t, q.Stop())
 	// No more retries should be scheduled.
+	checkQueueDir(t, q, []string{})
+}
+
+func TestQueueDelivery_RcptOptsRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	dt := unreliableTarget{
+		rcptFailures: []map[string]error{
+			{
+				"tester1@example.org": exterrors.WithTemporary(errors.New("go away"), true),
+			},
+		},
+		committed: make(chan testutils.Msg, 10),
+	}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	// Same rationale as TestQueueDelivery_SerializationRoundtrip: slow the
+	// retry down so we can Stop and reload from disk before it fires.
+	q.initialRetryTime = 1 * time.Second
+	q.postInitDelay = 0
+
+	// Per-recipient DSN parameters attached to tester1.
+	wantOpts := smtp.RcptOptions{
+		Notify:                []smtp.DSNNotify{"FAILURE", "DELAY"},
+		OriginalRecipient:     "tester1+orig@example.org",
+		OriginalRecipientType: "rfc822",
+	}
+
+	IDRaw := sha1.Sum([]byte(t.Name()))
+	encodedID := hex.EncodeToString(IDRaw[:])
+	body := buffer.MemoryBuffer{Slice: []byte("foobar\r\n")}
+	meta := module.MsgMetadata{
+		DontTraceSender: true,
+		ID:              encodedID,
+	}
+
+	delivery, err := q.StartDelivery(context.Background(), &meta, "tester@example.com")
+	if err != nil {
+		t.Fatalf("unexpected StartDelivery err: %v", err)
+	}
+	if err := delivery.AddRcpt(context.Background(), "tester1@example.org", wantOpts); err != nil {
+		t.Fatalf("unexpected AddRcpt err for tester1: %v", err)
+	}
+	if err := delivery.AddRcpt(context.Background(), "tester2@example.org", smtp.RcptOptions{}); err != nil {
+		t.Fatalf("unexpected AddRcpt err for tester2: %v", err)
+	}
+	if err := delivery.Body(context.Background(), textproto.Header{}, body); err != nil {
+		t.Fatalf("unexpected Body err: %v", err)
+	}
+	if err := delivery.Commit(context.Background()); err != nil {
+		t.Fatalf("unexpected Commit err: %v", err)
+	}
+
+	// First attempt: tester2 is delivered, tester1 fails temporarily and is
+	// persisted (together with its DSN options) for a later retry.
+	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
+	if !reflect.DeepEqual(msg.RcptTo, []string{"tester2@example.org"}) {
+		t.Fatalf("unexpected recipients on first attempt: %v", msg.RcptTo)
+	}
+
+	// Stop the queue and reload it from disk to force metadata deserialization.
+	require.NoError(t, q.Stop())
+	checkQueueDir(t, q, []string{encodedID})
+	q = newTestQueueDir(t, &dt, q.location)
+
+	// Retry attempt delivers tester1, now read back from disk.
+	msg = readMsgChanTimeout(t, dt.committed, 5*time.Second)
+	if !reflect.DeepEqual(msg.RcptTo, []string{"tester1@example.org"}) {
+		t.Fatalf("unexpected recipients on retry: %v", msg.RcptTo)
+	}
+
+	gotOpts, ok := msg.RcptOpts["tester1@example.org"]
+	if !ok {
+		t.Fatalf("per-recipient DSN options for tester1 were lost across queue persistence")
+	}
+	if !reflect.DeepEqual(gotOpts, wantOpts) {
+		t.Fatalf("DSN options changed across persistence:\n want %+v\n got  %+v", wantOpts, gotOpts)
+	}
+
+	require.NoError(t, q.Stop())
 	checkQueueDir(t, q, []string{})
 }
 

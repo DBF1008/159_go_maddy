@@ -379,7 +379,16 @@ func (c *C) Rcpt(ctx context.Context, to string, opts smtp.RcptOptions) error {
 	defer trace.StartRegion(ctx, "smtpconn/RCPT TO").End()
 
 	outOpts := &smtp.RcptOptions{
-		// TODO: DSN support
+		// Future extensions may add additional fields that should not be
+		// copied blindly. So we copy only fields we know should be handled
+		// this way.
+		//
+		// Forward the per-recipient DSN parameters (NOTIFY, ORCPT) requested
+		// by the original client so delivery status notifications can follow
+		// the message downstream.
+		Notify:                opts.Notify,
+		OriginalRecipient:     opts.OriginalRecipient,
+		OriginalRecipientType: opts.OriginalRecipientType,
 	}
 
 	// If necessary, the extension flag is enabled in StartDelivery.

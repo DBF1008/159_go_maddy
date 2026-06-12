@@ -172,6 +172,16 @@ type QueueMetadata struct {
 	// also it is directly usable for bounce messages.
 	RcptErrs map[string]*smtp.SMTPError
 
+	// Per-recipient DSN parameters (NOTIFY, ORCPT) as requested by the
+	// original client, keyed by the effective recipient address (same key
+	// space as RcptErrs and TriesCount).
+	//
+	// Preserved across restarts so they can be replayed on the downstream
+	// RCPT TO command. A missing/nil entry means no DSN parameters were
+	// requested for that recipient, which is the common case for older
+	// metadata files too.
+	RcptOpts map[string]smtp.RcptOptions
+
 	// Amount of times delivery *already tried*.
 	TriesCount map[string]int
 
@@ -508,7 +518,7 @@ func (q *Queue) deliver(ctx context.Context, meta *QueueMetadata, header textpro
 	var acceptedRcpts []string
 	for _, rcpt := range meta.To {
 		rcptCtx, rcptTask := trace.NewTask(msgCtx, "RCPT TO")
-		if err := delivery.AddRcpt(rcptCtx, rcpt, smtp.RcptOptions{} /* TODO: DSN support */); err != nil {
+		if err := delivery.AddRcpt(rcptCtx, rcpt, meta.RcptOpts[rcpt]); err != nil {
 			dl.Debugf("delivery.AddRcpt %s failed: %v", rcpt, err)
 			perr.Errs[rcpt] = err
 		} else {
@@ -592,8 +602,26 @@ type queueDelivery struct {
 	body   buffer.Buffer
 }
 
-func (qd *queueDelivery) AddRcpt(ctx context.Context, rcptTo string, _ smtp.RcptOptions) error {
+// rcptOptsEmpty reports whether opts carries no per-recipient DSN parameters
+// worth persisting. The common case (no DSN requested) keeps the queue
+// metadata identical to its previous on-disk format.
+func rcptOptsEmpty(opts smtp.RcptOptions) bool {
+	return len(opts.Notify) == 0 &&
+		opts.OriginalRecipient == "" &&
+		opts.OriginalRecipientType == ""
+}
+
+func (qd *queueDelivery) AddRcpt(ctx context.Context, rcptTo string, opts smtp.RcptOptions) error {
 	qd.meta.To = append(qd.meta.To, rcptTo)
+	// Preserve per-recipient DSN parameters (NOTIFY, ORCPT) so they can be
+	// replayed on the downstream RCPT TO command, possibly after a restart
+	// (they are persisted as part of QueueMetadata).
+	if !rcptOptsEmpty(opts) {
+		if qd.meta.RcptOpts == nil {
+			qd.meta.RcptOpts = make(map[string]smtp.RcptOptions)
+		}
+		qd.meta.RcptOpts[rcptTo] = opts
+	}
 	return nil
 }
 

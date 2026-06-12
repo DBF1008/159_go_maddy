@@ -40,6 +40,10 @@ type Msg struct {
 	MsgMeta  *module.MsgMetadata
 	MailFrom string
 	RcptTo   []string
+	// RcptOpts holds the per-recipient options (e.g. DSN NOTIFY/ORCPT) that
+	// were passed to AddRcpt, keyed by recipient address. Targets may leave
+	// it nil if they do not record options.
+	RcptOpts map[string]smtp.RcptOptions
 	Body     []byte
 	Header   textproto.Header
 }
