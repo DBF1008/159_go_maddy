@@ -346,6 +346,11 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 	}
 
 	if err := store.updPipe.InitPush(); err != nil {
+		// Close the pipe to release any listener goroutine that was
+		// started above, preventing a resource leak.
+		if closeErr := store.updPipe.Close(); closeErr != nil {
+			store.log.Error("updatepipe close after init failure", closeErr)
+		}
 		store.updPipe = nil
 		return err
 	}
@@ -354,15 +359,22 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 
 	store.updPushStop = make(chan struct{}, 1)
 	go func() {
+		// LIFO order: last defer runs first.
+		//
+		// 3. (innermost) Catch panics from the main loop or drain.
+		// 2. Drain remaining outbound updates so no in-flight
+		//    messages are lost on shutdown.
+		// 1. (outermost) Always signal updPushStop so Stop() does not
+		//    hang, regardless of whether the drain panicked.
+		defer func() { store.updPushStop <- struct{}{} }()
 		defer func() {
-			// Ensure we sent all outbound updates.
 			for upd := range outbound {
 				if err := store.updPipe.Push(upd); err != nil {
 					store.log.Error("IMAP update pipe push failed", err)
 				}
 			}
-			store.updPushStop <- struct{}{}
-
+		}()
+		defer func() {
 			if err := recover(); err != nil {
 				stack := debug.Stack()
 				log.Printf("panic during imapsql update push: %v\n%s", err, stack)

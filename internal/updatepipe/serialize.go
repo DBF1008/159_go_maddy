@@ -51,7 +51,11 @@ func parseUpdate(s string) (id string, upd *mess.Update, err error) {
 	}
 
 	if val, ok := upd.Key.(json.Number); ok {
-		upd.Key, _ = strconv.ParseUint(val.String(), 10, 64)
+		parsed, err := strconv.ParseUint(val.String(), 10, 64)
+		if err != nil {
+			return "", nil, fmt.Errorf("parseUpdate: invalid Key value %q: %w", val.String(), err)
+		}
+		upd.Key = parsed
 	}
 
 	return parts[0], upd, nil

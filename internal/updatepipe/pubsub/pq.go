@@ -21,12 +21,18 @@ type PqPubSub struct {
 	sender *sql.DB
 
 	Log *log.Logger
+
+	// forwarderDone is closed during Close to ensure the forwarder
+	// goroutine exits even when it is blocked sending to Notify and
+	// no consumer is reading from it.
+	forwarderDone chan struct{}
 }
 
 func NewPQ(dsn string) (*PqPubSub, error) {
 	l := &PqPubSub{
-		Log:    log.DefaultLogger.Sublogger("pgpubsub"),
-		Notify: make(chan Msg),
+		Log:           log.DefaultLogger.Sublogger("pgpubsub"),
+		Notify:        make(chan Msg),
+		forwarderDone: make(chan struct{}),
 	}
 	l.L = pq.NewListener(dsn, 10*time.Second, time.Minute, l.eventHandler)
 	var err error
@@ -42,7 +48,11 @@ func NewPQ(dsn string) (*PqPubSub, error) {
 				continue
 			}
 
-			l.Notify <- Msg{Key: n.Channel, Payload: n.Extra}
+			select {
+			case l.Notify <- Msg{Key: n.Channel, Payload: n.Extra}:
+			case <-l.forwarderDone:
+				return
+			}
 		}
 	}()
 
@@ -53,10 +63,31 @@ func (l *PqPubSub) Close() error {
 	if err := l.sender.Close(); err != nil {
 		l.Log.Error("failed to close sender socket", err)
 	}
+
+	// Close the pq.Listener. This closes the internal l.L.Notify channel,
+	// which causes the forwarder's range loop to end once it finishes
+	// processing any in-flight message.
 	if err := l.L.Close(); err != nil {
 		l.Log.Error("failed to close listener", err)
 	}
-	return nil
+
+	// Drain any remaining messages from the Notify channel. The forwarder
+	// may have sent a message before seeing l.L.Notify close.
+	for {
+		select {
+		case _, ok := <-l.Notify:
+			if !ok {
+				// Channel closed, forwarder's range loop ended.
+				close(l.forwarderDone)
+				return nil
+			}
+			// Drop the message — the consumer (PubSubPipe) has
+			// already been signaled to stop.
+		case <-l.forwarderDone:
+			// Already closed (shouldn't happen, but be safe).
+			return nil
+		}
+	}
 }
 
 func (l *PqPubSub) eventHandler(ev pq.ListenerEventType, err error) {

@@ -14,9 +14,16 @@ import (
 type PubSubPipe struct {
 	PubSub pubsub.PubSub
 	Log    *log.Logger
+
+	// done is closed when Close is called to signal the Listen goroutine
+	// to exit, preventing deadlocks when the inbound channel is full
+	// during shutdown.
+	done chan struct{}
 }
 
 func (p *PubSubPipe) Listen(upds chan<- mess.Update) error {
+	p.done = make(chan struct{})
+
 	go func() {
 		for m := range p.PubSub.Listener() {
 			id, upd, err := parseUpdate(m.Payload)
@@ -27,7 +34,11 @@ func (p *PubSubPipe) Listen(upds chan<- mess.Update) error {
 			if id == p.myID() {
 				continue
 			}
-			upds <- *upd
+			select {
+			case upds <- *upd:
+			case <-p.done:
+				return
+			}
 		}
 	}()
 	return nil
@@ -97,5 +108,15 @@ func (p *PubSubPipe) Push(upd mess.Update) error {
 }
 
 func (p *PubSubPipe) Close() error {
+	// 1. Signal the Listen goroutine to stop sending to the inbound
+	//    channel. This unblocks any goroutine waiting in the select
+	//    { case upds <- ...; case <-done }.
+	if p.done != nil {
+		close(p.done)
+	}
+
+	// 2. Close the underlying pubsub transport. This closes the
+	//    Listener() channel, which causes the range loop in the Listen
+	//    goroutine to exit.
 	return p.PubSub.Close()
 }

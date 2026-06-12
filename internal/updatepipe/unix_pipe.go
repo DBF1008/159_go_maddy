@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 
 	mess "github.com/foxcpp/go-imap-mess"
 	"github.com/foxcpp/maddy/framework/log"
@@ -49,6 +50,20 @@ type UnixSockPipe struct {
 
 	listener net.Listener
 	sender   net.Conn
+
+	// done is closed when Close is called to signal listener and reader
+	// goroutines to exit.
+	done chan struct{}
+
+	// readersWg tracks active readUpdates goroutines so Close can wait
+	// for them to finish before returning.
+	readersWg sync.WaitGroup
+
+	// readersMu protects readers.
+	readersMu sync.Mutex
+	// readers holds all currently open reader connections so Close can
+	// forcibly unblock any goroutine stuck in bufio.Scanner.Scan.
+	readers []net.Conn
 }
 
 var _ P = &UnixSockPipe{}
@@ -58,11 +73,19 @@ func (usp *UnixSockPipe) myID() string {
 }
 
 func (usp *UnixSockPipe) readUpdates(conn net.Conn, updCh chan<- mess.Update) {
+	defer usp.readersWg.Done()
+	defer conn.Close()
+
+	usp.readersMu.Lock()
+	usp.readers = append(usp.readers, conn)
+	usp.readersMu.Unlock()
+
 	scnr := bufio.NewScanner(conn)
 	for scnr.Scan() {
 		id, upd, err := parseUpdate(scnr.Text())
 		if err != nil {
 			usp.Log.Error("malformed update received", err, "str", scnr.Text())
+			continue
 		}
 
 		// It is our own update, skip.
@@ -70,7 +93,11 @@ func (usp *UnixSockPipe) readUpdates(conn net.Conn, updCh chan<- mess.Update) {
 			continue
 		}
 
-		updCh <- *upd
+		select {
+		case updCh <- *upd:
+		case <-usp.done:
+			return
+		}
 	}
 }
 
@@ -79,13 +106,20 @@ func (usp *UnixSockPipe) Listen(upd chan<- mess.Update) error {
 	if err != nil {
 		return err
 	}
+
+	usp.done = make(chan struct{})
+
+	usp.readersMu.Lock()
 	usp.listener = l
+	usp.readersMu.Unlock()
+
 	go func() {
 		for {
 			conn, err := l.Accept()
 			if err != nil {
 				return
 			}
+			usp.readersWg.Add(1)
 			go usp.readUpdates(conn, upd)
 		}
 	}()
@@ -119,11 +153,7 @@ func (usp *UnixSockPipe) Push(upd mess.Update) error {
 }
 
 func (usp *UnixSockPipe) Close() error {
-	if usp.sender != nil {
-		if err := usp.sender.Close(); err != nil {
-			usp.Log.Error("failed to close sender socket", err)
-		}
-	}
+	// 1. Stop accepting new connections.
 	if usp.listener != nil {
 		if err := usp.listener.Close(); err != nil {
 			usp.Log.Error("failed to close listener", err)
@@ -132,5 +162,32 @@ func (usp *UnixSockPipe) Close() error {
 			usp.Log.Error("failed to remove socket", err)
 		}
 	}
+
+	// 2. Signal all listener/reader goroutines to stop sending to the
+	//    inbound channel. This unblocks any goroutine waiting in the
+	//    select { case updCh <- ...; case <-done }.
+	if usp.done != nil {
+		close(usp.done)
+	}
+
+	// 3. Close all active reader connections. This unblocks any
+	//    goroutine stuck in bufio.Scanner.Scan by making the underlying
+	//    read return an error.
+	usp.readersMu.Lock()
+	for _, conn := range usp.readers {
+		conn.Close()
+	}
+	usp.readersMu.Unlock()
+
+	// 4. Wait for all reader goroutines to finish.
+	usp.readersWg.Wait()
+
+	// 5. Close the outbound sender connection.
+	if usp.sender != nil {
+		if err := usp.sender.Close(); err != nil {
+			usp.Log.Error("failed to close sender socket", err)
+		}
+	}
+
 	return nil
 }
