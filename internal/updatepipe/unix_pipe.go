@@ -20,10 +20,10 @@ package updatepipe
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 
 	mess "github.com/foxcpp/go-imap-mess"
 	"github.com/foxcpp/maddy/framework/log"
@@ -49,28 +49,32 @@ type UnixSockPipe struct {
 
 	listener net.Listener
 	sender   net.Conn
+
+	// mu guards the fields below, which are accessed both by the accept/reader
+	// goroutines and by Close.
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+	done   chan struct{}
+
+	// wg tracks the accept goroutine and every per-connection reader goroutine
+	// so Close can wait for all of them to actually exit.
+	wg sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 var _ P = &UnixSockPipe{}
 
 func (usp *UnixSockPipe) myID() string {
-	return fmt.Sprintf("%d-%p", os.Getpid(), usp)
+	return senderID(usp)
 }
 
 func (usp *UnixSockPipe) readUpdates(conn net.Conn, updCh chan<- mess.Update) {
+	myID := usp.myID()
 	scnr := bufio.NewScanner(conn)
 	for scnr.Scan() {
-		id, upd, err := parseUpdate(scnr.Text())
-		if err != nil {
-			usp.Log.Error("malformed update received", err, "str", scnr.Text())
-		}
-
-		// It is our own update, skip.
-		if id == usp.myID() {
-			continue
-		}
-
-		updCh <- *upd
+		dispatchUpdate(scnr.Text(), myID, updCh, usp.done, usp.Log)
 	}
 }
 
@@ -79,14 +83,43 @@ func (usp *UnixSockPipe) Listen(upd chan<- mess.Update) error {
 	if err != nil {
 		return err
 	}
+
+	usp.mu.Lock()
 	usp.listener = l
+	usp.done = make(chan struct{})
+	usp.conns = make(map[net.Conn]struct{})
+	usp.mu.Unlock()
+
+	usp.wg.Add(1)
 	go func() {
+		defer usp.wg.Done()
 		for {
 			conn, err := l.Accept()
 			if err != nil {
 				return
 			}
-			go usp.readUpdates(conn, upd)
+
+			usp.mu.Lock()
+			if usp.closed {
+				// Close ran between Accept and here; do not start a reader that
+				// Close would not be able to account for.
+				usp.mu.Unlock()
+				conn.Close()
+				return
+			}
+			usp.conns[conn] = struct{}{}
+			usp.wg.Add(1)
+			usp.mu.Unlock()
+
+			go func(c net.Conn) {
+				defer usp.wg.Done()
+				usp.readUpdates(c, upd)
+
+				usp.mu.Lock()
+				delete(usp.conns, c)
+				usp.mu.Unlock()
+				c.Close()
+			}(conn)
 		}
 	}()
 	return nil
@@ -98,15 +131,23 @@ func (usp *UnixSockPipe) InitPush() error {
 		return err
 	}
 
+	usp.mu.Lock()
 	usp.sender = sock
+	usp.mu.Unlock()
 	return nil
 }
 
 func (usp *UnixSockPipe) Push(upd mess.Update) error {
-	if usp.sender == nil {
+	usp.mu.Lock()
+	sender := usp.sender
+	usp.mu.Unlock()
+	if sender == nil {
 		if err := usp.InitPush(); err != nil {
 			return err
 		}
+		usp.mu.Lock()
+		sender = usp.sender
+		usp.mu.Unlock()
 	}
 
 	updStr, err := formatUpdate(usp.myID(), upd)
@@ -114,23 +155,49 @@ func (usp *UnixSockPipe) Push(upd mess.Update) error {
 		return err
 	}
 
-	_, err = io.WriteString(usp.sender, updStr)
+	_, err = io.WriteString(sender, updStr)
 	return err
 }
 
 func (usp *UnixSockPipe) Close() error {
-	if usp.sender != nil {
-		if err := usp.sender.Close(); err != nil {
-			usp.Log.Error("failed to close sender socket", err)
+	usp.closeOnce.Do(func() {
+		usp.mu.Lock()
+		usp.closed = true
+		if usp.done != nil {
+			close(usp.done)
 		}
-	}
-	if usp.listener != nil {
-		if err := usp.listener.Close(); err != nil {
-			usp.Log.Error("failed to close listener", err)
+		conns := make([]net.Conn, 0, len(usp.conns))
+		for c := range usp.conns {
+			conns = append(conns, c)
 		}
-		if err := os.Remove(usp.SockPath); err != nil {
-			usp.Log.Error("failed to remove socket", err)
+		sender := usp.sender
+		listener := usp.listener
+		usp.mu.Unlock()
+
+		if sender != nil {
+			if err := sender.Close(); err != nil {
+				usp.Log.Error("failed to close sender socket", err)
+			}
 		}
-	}
+		if listener != nil {
+			if err := listener.Close(); err != nil {
+				usp.Log.Error("failed to close listener", err)
+			}
+		}
+		// Closing the accepted connections unblocks readers that are parked in
+		// Scan; the closed done channel unblocks readers parked on the update
+		// channel. Together they guarantee every reader returns.
+		for _, c := range conns {
+			c.Close()
+		}
+
+		usp.wg.Wait()
+
+		if listener != nil {
+			if err := os.Remove(usp.SockPath); err != nil && !os.IsNotExist(err) {
+				usp.Log.Error("failed to remove socket", err)
+			}
+		}
+	})
 	return nil
 }

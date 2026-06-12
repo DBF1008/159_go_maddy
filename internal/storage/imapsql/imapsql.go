@@ -340,13 +340,13 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 
 	if mode == updatepipe.ModeReplicate {
 		if err := store.updPipe.Listen(inbound); err != nil {
-			store.updPipe = nil
+			store.closeUpdatePipe()
 			return err
 		}
 	}
 
 	if err := store.updPipe.InitPush(); err != nil {
-		store.updPipe = nil
+		store.closeUpdatePipe()
 		return err
 	}
 
@@ -387,6 +387,20 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 	}()
 
 	return nil
+}
+
+// closeUpdatePipe closes the update pipe (if any) and clears it so a later
+// EnableUpdatePipe call can retry from a clean state. It is shared by the
+// EnableUpdatePipe error paths and Stop to make sure the pipe (and its
+// listener goroutine, socket or PG connection) is never leaked.
+func (store *Storage) closeUpdatePipe() {
+	if store.updPipe == nil {
+		return
+	}
+	if err := store.updPipe.Close(); err != nil {
+		store.log.Error("updatepipe close failed", err)
+	}
+	store.updPipe = nil
 }
 
 func (store *Storage) I18NLevel() int {
@@ -443,9 +457,7 @@ func (store *Storage) Stop() error {
 		close(store.outboundUpds)
 		<-store.updPushStop
 
-		if err := store.updPipe.Close(); err != nil {
-			store.log.Error("updatepipe close failed", err)
-		}
+		store.closeUpdatePipe()
 	}
 
 	return nil

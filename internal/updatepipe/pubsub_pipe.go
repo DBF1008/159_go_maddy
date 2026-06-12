@@ -3,8 +3,8 @@ package updatepipe
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
+	"sync"
 
 	mess "github.com/foxcpp/go-imap-mess"
 	"github.com/foxcpp/maddy/framework/log"
@@ -14,20 +14,25 @@ import (
 type PubSubPipe struct {
 	PubSub pubsub.PubSub
 	Log    *log.Logger
+
+	// done is closed by Close to release the listener goroutine if it is parked
+	// trying to deliver an update. wg tracks that goroutine so Close can confirm
+	// it exited.
+	done chan struct{}
+	wg   sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 func (p *PubSubPipe) Listen(upds chan<- mess.Update) error {
+	p.done = make(chan struct{})
+	myID := p.myID()
+
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		for m := range p.PubSub.Listener() {
-			id, upd, err := parseUpdate(m.Payload)
-			if err != nil {
-				p.Log.Error("failed to parse update", err)
-				continue
-			}
-			if id == p.myID() {
-				continue
-			}
-			upds <- *upd
+			dispatchUpdate(m.Payload, myID, upds, p.done, p.Log)
 		}
 	}()
 	return nil
@@ -38,7 +43,7 @@ func (p *PubSubPipe) InitPush() error {
 }
 
 func (p *PubSubPipe) myID() string {
-	return fmt.Sprintf("%d-%p", os.Getpid(), p)
+	return senderID(p)
 }
 
 func (p *PubSubPipe) channel(key interface{}) (string, error) {
@@ -97,5 +102,16 @@ func (p *PubSubPipe) Push(upd mess.Update) error {
 }
 
 func (p *PubSubPipe) Close() error {
-	return p.PubSub.Close()
+	var err error
+	p.closeOnce.Do(func() {
+		// Release a listener goroutine parked on the update channel, then close
+		// the underlying PubSub so its Listener channel is closed and the
+		// goroutine's range loop terminates.
+		if p.done != nil {
+			close(p.done)
+		}
+		err = p.PubSub.Close()
+		p.wg.Wait()
+	})
+	return err
 }

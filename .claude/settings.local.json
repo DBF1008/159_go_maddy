@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=/home/bufan/go/bin:$PATH)",
+      "Bash(GOPROXY=off GOFLAGS=-mod=mod go doc github.com/foxcpp/go-imap-mess.Update)"
+    ]
+  }
+}

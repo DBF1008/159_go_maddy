@@ -42,7 +42,7 @@ type P interface {
 	// pipe.
 	//
 	// Updates sent using the same UpdatePipe object using Push are not
-	// duplicates to the channel passed to Listen.
+	// duplicated to the channel passed to Listen.
 	Listen(upds chan<- mess.Update) error
 
 	// InitPush prepares the UpdatePipe to be used as updates source (Push
