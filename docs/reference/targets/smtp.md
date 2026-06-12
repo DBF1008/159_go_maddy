@@ -32,6 +32,9 @@ target.smtp {
     connect_timeout 5m
     command_timeout 5m
     submission_timeout 12m
+    conn_reuse_limit 0
+    conn_max_idle_count 5
+    conn_max_idle_time 150
 }
 ```
 
@@ -121,3 +124,42 @@ Same as for target.remote.
 Default: `12m`
 
 Same as for target.remote.
+
+---
+
+### conn_reuse_limit _integer_
+Default: `0`
+
+Amount of times the same connection can be reused for consecutive deliveries to
+the same backend.
+
+`0` (the default) disables connection reuse entirely: every delivery opens a
+fresh connection and closes it on completion. Set a positive value to keep idle
+connections around and reuse them, avoiding a new TCP/TLS/SASL handshake per
+message when many messages are delivered to the same backend.
+
+Reuse is always safe:
+
+- Connections are never reused after a failed DATA command.
+- All addresses listed in `targets` form a single failover set and their
+  connections are pooled together (a connection opened to any of them may serve
+  a later delivery).
+- When per-message authentication is used (`auth forward`), connections are
+  additionally isolated by the authenticated identity, so a connection
+  authenticated as one user is never reused for another.
+
+---
+
+### conn_max_idle_count _integer_
+Default: `5`
+
+Max. amount of idle connections per connection key to keep in cache. Has no
+effect unless `conn_reuse_limit` is greater than zero.
+
+---
+
+### conn_max_idle_time _integer_
+Default: `150` (2.5 min)
+
+Amount of time (in seconds) the idle connection is still considered potentially
+usable. Has no effect unless `conn_reuse_limit` is greater than zero.

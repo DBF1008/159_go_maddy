@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"net"
 	"runtime/trace"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-message/textproto"
@@ -45,6 +46,7 @@ import (
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/smtpconn"
+	"github.com/foxcpp/maddy/internal/smtpconn/pool"
 	"github.com/foxcpp/maddy/internal/target"
 	"golang.org/x/net/idna"
 )
@@ -63,6 +65,17 @@ type Downstream struct {
 	connectTimeout    time.Duration
 	commandTimeout    time.Duration
 	submissionTimeout time.Duration
+
+	// connReuseLimit is the maximum number of SMTP transactions a single
+	// pooled connection may serve. When it is 0 connection reuse is disabled
+	// and pool is nil, making every delivery open and close its own
+	// connection (the historical behavior).
+	connReuseLimit int
+	pool           *pool.P
+	// poolKey is the part of the connection pool key shared by all messages
+	// going through this target instance (the configured endpoint set). The
+	// authenticated identity is appended per-message in connKey.
+	poolKey string
 
 	log *log.Logger
 }
@@ -127,6 +140,18 @@ func (u *Downstream) Configure(inlineArgs []string, cfg *config.Map) error {
 	cfg.Duration("command_timeout", false, false, 5*time.Minute, &u.commandTimeout)
 	cfg.Duration("submission_timeout", false, false, 5*time.Minute, &u.submissionTimeout)
 
+	// Connection reuse is opt-in: conn_reuse_limit defaults to 0 which keeps
+	// the historical behavior of one connection per delivery.
+	cfg.Int("conn_reuse_limit", false, false, 0, &u.connReuseLimit)
+	poolCfg := pool.Config{
+		MaxKeys:             1000,
+		MaxConnsPerKey:      5,      // basically, max. amount of idle connections in cache
+		MaxConnLifetimeSec:  150,    // 2.5 mins, half of recommended idle time from RFC 5321
+		StaleKeyLifetimeSec: 60 * 4, // make sure that cleanup runs before recommended idle time from RFC 5321
+	}
+	cfg.Int("conn_max_idle_count", false, false, 5, &poolCfg.MaxConnsPerKey)
+	cfg.Int64("conn_max_idle_time", false, false, 150, &poolCfg.MaxConnLifetimeSec)
+
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
@@ -156,6 +181,23 @@ func (u *Downstream) Configure(inlineArgs []string, cfg *config.Map) error {
 		return fmt.Errorf("%s: at least one target endpoint is required", u.modName)
 	}
 
+	if u.connReuseLimit > 0 {
+		// All endpoints of this instance form a single failover set sharing
+		// the same TLS and SASL configuration, so connections to any of them
+		// are interchangeable and pooled together under one base key.
+		addrs := make([]string, 0, len(u.endpoints))
+		for _, endp := range u.endpoints {
+			addrs = append(addrs, endp.String())
+		}
+		u.poolKey = strings.Join(addrs, ",")
+
+		// pool.Config.New is left unset on purpose: on a cache miss the pool
+		// returns (nil, nil) and we open a connection ourselves so that the
+		// per-message metadata (needed for SASL credential forwarding) is
+		// threaded through correctly.
+		u.pool = pool.New(poolCfg)
+	}
+
 	return nil
 }
 
@@ -167,6 +209,71 @@ func (u *Downstream) InstanceName() string {
 	return u.instName
 }
 
+func (u *Downstream) Start() error {
+	return nil
+}
+
+func (u *Downstream) Stop() error {
+	if u.pool != nil {
+		u.pool.Close()
+	}
+	return nil
+}
+
+// poolConn wraps smtpconn.C so it can be stored in the connection pool. It
+// tracks reuse-related bookkeeping (transaction count, error state) used to
+// decide whether the connection is still safe to hand out again.
+type poolConn struct {
+	*smtpconn.C
+
+	// reuseLimit is the maximum number of transactions this connection may
+	// serve (copied from Downstream.connReuseLimit).
+	reuseLimit int
+	// transactions counts how many SMTP transactions were attempted on this
+	// connection so far.
+	transactions int
+	// errored is set when a transaction left the connection in an
+	// indeterminate state (e.g. a failed DATA), making reuse unsafe.
+	errored   bool
+	lastUseAt time.Time
+}
+
+// Usable reports whether the connection can be reused for another transaction.
+// It also issues an RSET, both as a liveness probe and to discard any leftover
+// transaction state, mirroring the behavior of the remote target.
+func (c *poolConn) Usable() bool {
+	if c.C == nil || c.transactions > c.reuseLimit || c.Client() == nil || c.errored {
+		return false
+	}
+	return c.C.Client().Reset() == nil
+}
+
+func (c *poolConn) LastUseAt() time.Time {
+	return c.lastUseAt
+}
+
+func (c *poolConn) Close() error {
+	return c.C.Close()
+}
+
+// connKey computes the connection pool key for a message. Connections
+// authenticated as one principal must never be reused for another, so when
+// SASL is configured the authenticated identity is mixed into the key. This is
+// what makes reuse safe with "auth forward" where credentials vary per message.
+func (u *Downstream) connKey(msgMeta *module.MsgMetadata) string {
+	if u.saslFactory == nil {
+		return u.poolKey
+	}
+	var authUser string
+	if msgMeta.Conn != nil {
+		authUser = msgMeta.Conn.AuthUser
+	}
+	// NUL is not a valid character in either an endpoint address or a
+	// username, so it is a safe separator. Only the (non-secret) username is
+	// used to avoid leaking credentials through pool key logging.
+	return u.poolKey + "\x00" + authUser
+}
+
 type delivery struct {
 	u   *Downstream
 	log *log.Logger
@@ -175,7 +282,10 @@ type delivery struct {
 	mailFrom string
 	rcpts    []string
 
-	conn *smtpconn.C
+	conn *poolConn
+	// poolKey is the key under which conn should be returned to the pool. It
+	// is set in connect and includes the per-message authenticated identity.
+	poolKey string
 }
 
 // lmtpDelivery implements module.PartialDelivery
@@ -217,7 +327,34 @@ func (d *delivery) closeConn(c *smtpconn.C) {
 }
 
 func (d *delivery) connect(ctx context.Context) error {
-	// TODO: Review possibility of connection pooling here.
+	if d.u.pool != nil {
+		d.poolKey = d.u.connKey(d.msgMeta)
+
+		pooled, err := d.u.pool.Get(ctx, d.poolKey)
+		if err != nil {
+			return err
+		}
+		if pooled != nil {
+			d.conn = pooled.(*poolConn)
+			d.log.DebugMsg("reusing pooled connection", "downstream_server", d.conn.ServerName(),
+				"local_addr", d.conn.LocalAddr(), "remote_addr", d.conn.RemoteAddr(),
+				"transactions", d.conn.transactions)
+			return nil
+		}
+	}
+
+	conn, err := d.newConn(ctx)
+	if err != nil {
+		return err
+	}
+	d.conn = conn
+	return nil
+}
+
+// newConn opens a fresh connection to the first reachable endpoint, performing
+// SASL authentication if configured. The endpoint failover loop and SASL login
+// behavior are identical to the historical (non-pooled) implementation.
+func (d *delivery) newConn(ctx context.Context) (*poolConn, error) {
 	var lastErr error
 
 	conn := smtpconn.New()
@@ -255,25 +392,27 @@ func (d *delivery) connect(ctx context.Context) error {
 		break
 	}
 	if lastErr != nil {
-		return d.u.moduleError(lastErr)
+		return nil, d.u.moduleError(lastErr)
 	}
 
 	if d.u.saslFactory != nil {
 		saslClient, err := d.u.saslFactory(d.msgMeta)
 		if err != nil {
 			d.closeConn(conn)
-			return err
+			return nil, err
 		}
 
 		if err := conn.Client().Auth(saslClient); err != nil {
 			d.closeConn(conn)
-			return err
+			return nil, err
 		}
 	}
 
-	d.conn = conn
-
-	return nil
+	return &poolConn{
+		C:          conn,
+		reuseLimit: d.u.connReuseLimit,
+		lastUseAt:  time.Now(),
+	}, nil
 }
 
 func (d *delivery) AddRcpt(ctx context.Context, rcptTo string, opts smtp.RcptOptions) error {
@@ -297,7 +436,14 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 			d.log.Msg("failed to close body buffer", err)
 		}
 	}()
-	return d.u.moduleError(d.conn.Data(ctx, header, r))
+
+	err = d.conn.Data(ctx, header, r)
+	if err != nil {
+		// A failed DATA may leave the connection in an indeterminate state,
+		// so it must not be reused.
+		d.conn.errored = true
+	}
+	return d.u.moduleError(err)
 }
 
 func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollector, header textproto.Header, body buffer.Buffer) {
@@ -330,6 +476,10 @@ func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollec
 		rcptIndx++
 	})
 	if err != nil {
+		// An error here (as opposed to a per-recipient status reported via the
+		// callback) is a protocol/transport failure that makes the connection
+		// unsafe to reuse.
+		d.conn.errored = true
 		modErr := d.u.moduleError(err)
 		for _, rcpt := range d.rcpts[rcptIndx:] {
 			sc.SetStatus(rcpt, modErr)
@@ -338,11 +488,41 @@ func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollec
 }
 
 func (d *delivery) Abort(ctx context.Context) error {
-	return d.conn.Close()
+	return d.finish()
 }
 
 func (d *delivery) Commit(ctx context.Context) error {
-	return d.conn.Close()
+	return d.finish()
+}
+
+// finish releases the connection used by this delivery. With pooling disabled
+// the connection is simply closed (the historical behavior). With pooling
+// enabled it is returned to the pool when still safe to reuse, or closed
+// otherwise (after an error or once the reuse limit is reached).
+func (d *delivery) finish() error {
+	conn := d.conn
+	if conn == nil {
+		return nil
+	}
+	d.conn = nil
+
+	if d.u.pool == nil {
+		return conn.Close()
+	}
+
+	conn.transactions++
+	conn.lastUseAt = time.Now()
+
+	if conn.Usable() {
+		d.log.DebugMsg("returning connection to pool", "downstream_server", conn.ServerName(),
+			"transactions", conn.transactions)
+		d.u.pool.Return(d.poolKey, conn)
+		return nil
+	}
+
+	d.log.DebugMsg("closing connection", "downstream_server", conn.ServerName(),
+		"transactions", conn.transactions, "errored", conn.errored)
+	return conn.Close()
 }
 
 func init() {

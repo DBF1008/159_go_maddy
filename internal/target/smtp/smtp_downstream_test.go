@@ -29,6 +29,8 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/exterrors"
+	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/internal/smtpconn/pool"
 	"github.com/foxcpp/maddy/internal/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -273,6 +275,189 @@ func TestDownstreamDelivery_StartTLS_NoFallback(t *testing.T) {
 	_, err := testutils.DoTestDeliveryErr(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
 	if err == nil {
 		t.Error("Expected an error, got none")
+	}
+}
+
+// poolTestConfig is a permissive pool configuration used by the connection
+// reuse tests: it keeps idle connections cached effectively forever so that
+// reuse decisions are driven solely by the reuse limit and connection error
+// state, not by background expiry.
+func poolTestConfig() pool.Config {
+	return pool.Config{
+		MaxKeys:             100,
+		MaxConnsPerKey:      5,
+		MaxConnLifetimeSec:  9999,
+		StaleKeyLifetimeSec: 9999,
+	}
+}
+
+func TestDownstreamDelivery_ConnReuse(t *testing.T) {
+	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
+	defer testutils.CheckSMTPConnLeak(t, srv)
+
+	mod := &Downstream{
+		hostname: "mx.example.invalid",
+		endpoints: []config.Endpoint{
+			{
+				Scheme: "tcp",
+				Host:   "127.0.0.1",
+				Port:   testPort,
+			},
+		},
+		connReuseLimit: 10,
+		poolKey:        "127.0.0.1:" + testPort,
+		pool:           pool.New(poolTestConfig()),
+		log:            testutils.Logger(t, "target.smtp"),
+	}
+	// Closing the pool drops the idle connection it holds; do it before the
+	// deferred leak check runs (defers execute LIFO).
+	defer mod.Stop()
+
+	testutils.DoTestDelivery(t, mod, "test1@example.invalid", []string{"rcpt1@example.invalid"})
+	testutils.DoTestDelivery(t, mod, "test2@example.invalid", []string{"rcpt2@example.invalid"})
+
+	be.CheckMsg(t, 0, "test1@example.invalid", []string{"rcpt1@example.invalid"})
+	be.CheckMsg(t, 1, "test2@example.invalid", []string{"rcpt2@example.invalid"})
+
+	// Both messages must have travelled over a single backend session.
+	if be.SessionCounter != 1 {
+		t.Errorf("expected a single reused connection, got %d sessions", be.SessionCounter)
+	}
+}
+
+func TestDownstreamDelivery_ConnReuse_Limit(t *testing.T) {
+	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
+	defer testutils.CheckSMTPConnLeak(t, srv)
+
+	mod := &Downstream{
+		hostname: "mx.example.invalid",
+		endpoints: []config.Endpoint{
+			{
+				Scheme: "tcp",
+				Host:   "127.0.0.1",
+				Port:   testPort,
+			},
+		},
+		connReuseLimit: 1,
+		poolKey:        "127.0.0.1:" + testPort,
+		pool:           pool.New(poolTestConfig()),
+		log:            testutils.Logger(t, "target.smtp"),
+	}
+	defer mod.Stop()
+
+	// With conn_reuse_limit=1 a connection may serve two transactions before it
+	// is retired (reuse is denied once the transaction count exceeds the
+	// limit), so four deliveries require exactly two connections.
+	for i := 0; i < 4; i++ {
+		testutils.DoTestDelivery(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
+	}
+
+	if be.SessionCounter != 2 {
+		t.Errorf("expected reuse limit to force 2 connections, got %d sessions", be.SessionCounter)
+	}
+}
+
+func TestDownstreamDelivery_ConnReuse_ErroredNotReused(t *testing.T) {
+	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
+	defer testutils.CheckSMTPConnLeak(t, srv)
+
+	mod := &Downstream{
+		hostname: "mx.example.invalid",
+		endpoints: []config.Endpoint{
+			{
+				Scheme: "tcp",
+				Host:   "127.0.0.1",
+				Port:   testPort,
+			},
+		},
+		connReuseLimit: 10,
+		poolKey:        "127.0.0.1:" + testPort,
+		pool:           pool.New(poolTestConfig()),
+		log:            testutils.Logger(t, "target.smtp"),
+	}
+	defer mod.Stop()
+
+	// A failed DATA leaves the connection in an indeterminate state, so it must
+	// be dropped instead of returned to the pool.
+	be.DataErr = &smtp.SMTPError{
+		Code:    450,
+		Message: "temporary failure",
+	}
+	if _, err := testutils.DoTestDeliveryErr(t, mod, "test1@example.invalid", []string{"rcpt1@example.invalid"}); err == nil {
+		t.Fatal("expected delivery to fail")
+	}
+
+	be.DataErr = nil
+	testutils.DoTestDelivery(t, mod, "test2@example.invalid", []string{"rcpt2@example.invalid"})
+	be.CheckMsg(t, 0, "test2@example.invalid", []string{"rcpt2@example.invalid"})
+
+	// The second delivery must have opened a fresh connection rather than
+	// reusing the errored one.
+	if be.SessionCounter != 2 {
+		t.Errorf("expected errored connection to be dropped (2 sessions), got %d", be.SessionCounter)
+	}
+}
+
+func TestDownstreamDelivery_ConnReuse_AuthIsolation(t *testing.T) {
+	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
+	defer testutils.CheckSMTPConnLeak(t, srv)
+
+	mod := &Downstream{
+		hostname: "mx.example.invalid",
+		endpoints: []config.Endpoint{
+			{
+				Scheme: "tcp",
+				Host:   "127.0.0.1",
+				Port:   testPort,
+			},
+		},
+		saslFactory:    testSaslFactory(t, "forward"),
+		connReuseLimit: 10,
+		poolKey:        "127.0.0.1:" + testPort,
+		pool:           pool.New(poolTestConfig()),
+		log:            testutils.Logger(t, "target.smtp"),
+	}
+	defer mod.Stop()
+
+	deliverAs := func(from, rcpt, user, pass string) {
+		t.Helper()
+		testutils.DoTestDeliveryMeta(t, mod, from, []string{rcpt}, &module.MsgMetadata{
+			Conn: &module.ConnState{
+				AuthUser:     user,
+				AuthPassword: pass,
+			},
+		})
+	}
+
+	// Two deliveries authenticated as the same user may share a connection.
+	deliverAs("a1@example.invalid", "r1@example.invalid", "alice", "pass")
+	deliverAs("a2@example.invalid", "r2@example.invalid", "alice", "pass")
+	// A delivery authenticated as a different user must NOT reuse alice's
+	// connection: connKey mixes the authenticated identity into the pool key so
+	// credentials are never shared across principals.
+	deliverAs("b1@example.invalid", "r3@example.invalid", "bob", "pass")
+
+	if be.SessionCounter != 2 {
+		t.Errorf("expected 2 connections (alice reused, bob separate), got %d sessions", be.SessionCounter)
+	}
+	if be.Messages[0].AuthUser != "alice" || be.Messages[1].AuthUser != "alice" {
+		t.Errorf("expected first two messages authenticated as alice, got %q and %q",
+			be.Messages[0].AuthUser, be.Messages[1].AuthUser)
+	}
+	if be.Messages[2].AuthUser != "bob" {
+		t.Errorf("expected third message authenticated as bob, got %q", be.Messages[2].AuthUser)
 	}
 }
 
