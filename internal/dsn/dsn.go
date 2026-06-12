@@ -114,8 +114,9 @@ const (
 )
 
 type RecipientInfo struct {
-	FinalRecipient string
-	RemoteMTA      string
+	FinalRecipient    string
+	OriginalRecipient string // From ORCPT parameter (RFC 3461), optional.
+	RemoteMTA         string
 
 	Action Action
 	Status smtp.EnhancedCode

@@ -114,6 +114,7 @@ func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	endp.serv.LMTP = endp.lmtp
 	endp.serv.EnableSMTPUTF8 = true
 	endp.serv.EnableREQUIRETLS = true
+	endp.serv.EnableDSN = true
 	if err := endp.setConfig(cfg); err != nil {
 		return err
 	}
