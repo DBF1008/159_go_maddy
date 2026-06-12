@@ -12,3 +12,7 @@ import (
 func TestStore(t *testing.T, newStore func() module.BlobStore, cleanStore func(module.BlobStore)) {
 	t.Skip("storage.blob tests require CGo and sqlite3")
 }
+
+func TestExtStoreAdapter(t *testing.T, newStore func() module.BlobStore, cleanStore func(module.BlobStore)) {
+	t.Skip("storage.blob tests require CGo and sqlite3")
+}

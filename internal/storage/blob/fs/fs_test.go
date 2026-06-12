@@ -18,3 +18,12 @@ func TestFS(t *testing.T) {
 		require.NoError(t, os.RemoveAll(store.(*FSStore).root))
 	})
 }
+
+func TestExtBlobStore(t *testing.T) {
+	blob.TestExtStoreAdapter(t, func() module.BlobStore {
+		dir := testutils.Dir(t)
+		return &FSStore{instName: "test", root: dir}
+	}, func(store module.BlobStore) {
+		require.NoError(t, os.RemoveAll(store.(*FSStore).root))
+	})
+}

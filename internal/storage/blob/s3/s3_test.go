@@ -69,3 +69,52 @@ func TestFS(t *testing.T) {
 		ts.Close()
 	}
 }
+
+func TestExtBlobStore(t *testing.T) {
+	var ts *httptest.Server
+
+	blob.TestExtStoreAdapter(t, func() module.BlobStore {
+		backend := s3mem.New()
+		faker := gofakes3.New(backend)
+		ts = httptest.NewServer(faker.Server())
+
+		if err := backend.CreateBucket("maddy-test"); err != nil {
+			panic(err)
+		}
+
+		st := &Store{instName: "test"}
+		err := st.Configure(nil, config.NewMap(map[string]interface{}{}, config.Node{
+			Children: []config.Node{
+				{
+					Name: "endpoint",
+					Args: []string{ts.Listener.Addr().String()},
+				},
+				{
+					Name: "secure",
+					Args: []string{"false"},
+				},
+				{
+					Name: "access_key",
+					Args: []string{"access-key"},
+				},
+				{
+					Name: "secret_key",
+					Args: []string{"secret-key"},
+				},
+				{
+					Name: "bucket",
+					Args: []string{"maddy-test"},
+				},
+			},
+		}))
+		if err != nil {
+			panic(err)
+		}
+
+		return st
+	}, func(store module.BlobStore) {
+		if ts != nil {
+			ts.Close()
+		}
+	})
+}
