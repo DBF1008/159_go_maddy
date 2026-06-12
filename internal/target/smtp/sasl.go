@@ -25,10 +25,18 @@ import (
 	"github.com/foxcpp/maddy/framework/module"
 )
 
-type saslClientFactory = func(msgMeta *module.MsgMetadata) (sasl.Client, error)
+// saslConfig holds both a factory for creating SASL clients and an identity
+// extractor used to compute the pool key for connection reuse. The identity
+// function returns a stable string that uniquely identifies the SASL
+// credentials for a given message (e.g. "plain:user", "forward:alice").
+type saslConfig struct {
+	factory  func(msgMeta *module.MsgMetadata) (sasl.Client, error)
+	identity func(msgMeta *module.MsgMetadata) string
+}
 
-// saslAuthDirective returns saslClientFactory function used to create sasl.Client.
-// for use in outbound connections.
+// saslAuthDirective returns a saslConfig used to create sasl.Client
+// for use in outbound connections and to extract the SASL identity for
+// connection pool keying.
 //
 // Authentication information of the current client should be passed in arguments.
 func saslAuthDirective(_ *config.Map, node config.Node) (interface{}, error) {
@@ -40,42 +48,66 @@ func saslAuthDirective(_ *config.Map, node config.Node) (interface{}, error) {
 	}
 	switch node.Args[0] {
 	case "off":
-		return nil, nil
+		return &saslConfig{
+			factory:  nil,
+			identity: func(*module.MsgMetadata) string { return "" },
+		}, nil
 	case "forward":
 		if len(node.Args) > 1 {
 			return nil, config.NodeErr(node, "no additional arguments required")
 		}
-		return func(msgMeta *module.MsgMetadata) (sasl.Client, error) {
-			if msgMeta.Conn == nil || msgMeta.Conn.AuthUser == "" || msgMeta.Conn.AuthPassword == "" {
-				return nil, &exterrors.SMTPError{
-					Code:         530,
-					EnhancedCode: exterrors.EnhancedCode{5, 7, 0},
-					Message:      "Authentication is required",
-					TargetName:   "target.smtp",
-					Reason:       "Credentials forwarding is requested but the client is not authenticated",
+		return &saslConfig{
+			factory: func(msgMeta *module.MsgMetadata) (sasl.Client, error) {
+				if msgMeta.Conn == nil || msgMeta.Conn.AuthUser == "" || msgMeta.Conn.AuthPassword == "" {
+					return nil, &exterrors.SMTPError{
+						Code:         530,
+						EnhancedCode: exterrors.EnhancedCode{5, 7, 0},
+						Message:      "Authentication is required",
+						TargetName:   "target.smtp",
+						Reason:       "Credentials forwarding is requested but the client is not authenticated",
+					}
 				}
-			}
-			return sasl.NewPlainClient("", msgMeta.Conn.AuthUser, msgMeta.Conn.AuthPassword), nil
+				return sasl.NewPlainClient("", msgMeta.Conn.AuthUser, msgMeta.Conn.AuthPassword), nil
+			},
+			identity: func(msgMeta *module.MsgMetadata) string {
+				if msgMeta != nil && msgMeta.Conn != nil && msgMeta.Conn.AuthUser != "" {
+					return "forward:" + msgMeta.Conn.AuthUser
+				}
+				return "forward:"
+			},
 		}, nil
 	case "plain", "login":
 		if len(node.Args) != 3 {
-			return nil, config.NodeErr(node, "two additional arguments are required (username, password)")
+			return nil, config.NodeErr(node, "two additional arguments required (username, password)")
 		}
-		return func(*module.MsgMetadata) (sasl.Client, error) {
-			if node.Args[0] == "plain" {
-				return sasl.NewPlainClient("", node.Args[1], node.Args[2]), nil
-			}
-			if node.Args[0] == "login" {
-				return sasl.NewLoginClient(node.Args[1], node.Args[2]), nil
-			}
-			return nil, config.NodeErr(node, "unknown authentication mechanism: %s", node.Args[0])
+		mech := node.Args[0]
+		user := node.Args[1]
+		pass := node.Args[2]
+		return &saslConfig{
+			factory: func(*module.MsgMetadata) (sasl.Client, error) {
+				if mech == "plain" {
+					return sasl.NewPlainClient("", user, pass), nil
+				}
+				if mech == "login" {
+					return sasl.NewLoginClient(user, pass), nil
+				}
+				return nil, config.NodeErr(node, "unknown authentication mechanism: %s", mech)
+			},
+			identity: func(*module.MsgMetadata) string {
+				return mech + ":" + user
+			},
 		}, nil
 	case "external":
 		if len(node.Args) > 1 {
 			return nil, config.NodeErr(node, "no additional arguments required")
 		}
-		return func(*module.MsgMetadata) (sasl.Client, error) {
-			return sasl.NewExternalClient(""), nil
+		return &saslConfig{
+			factory: func(*module.MsgMetadata) (sasl.Client, error) {
+				return sasl.NewExternalClient(""), nil
+			},
+			identity: func(*module.MsgMetadata) string {
+				return "external"
+			},
 		}, nil
 	default:
 		return nil, config.NodeErr(node, "unknown authentication mechanism: %s", node.Args[0])

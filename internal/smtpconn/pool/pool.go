@@ -170,6 +170,7 @@ func (p *P) Return(key string, c Conn) {
 	defer p.keysLock.Unlock()
 
 	if p.keys == nil {
+		go p.close(c)
 		return
 	}
 

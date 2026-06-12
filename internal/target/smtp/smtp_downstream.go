@@ -45,6 +45,7 @@ import (
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/smtpconn"
+	"github.com/foxcpp/maddy/internal/smtpconn/pool"
 	"github.com/foxcpp/maddy/internal/target"
 	"golang.org/x/net/idna"
 )
@@ -57,12 +58,19 @@ type Downstream struct {
 	starttls    bool
 	hostname    string
 	endpoints   []config.Endpoint
-	saslFactory saslClientFactory
+	saslCfg     *saslConfig
 	tlsConfig   *tls.Config
 
 	connectTimeout    time.Duration
 	commandTimeout    time.Duration
 	submissionTimeout time.Duration
+
+	// Connection reuse (pooling) configuration.
+	// When connReuseLimit is 0, pooling is disabled (nil pool).
+	connReuseLimit   int
+	connMaxIdleCount int
+	connMaxIdleTime  int64
+	pool             *pool.P
 
 	log *log.Logger
 }
@@ -119,13 +127,16 @@ func (u *Downstream) Configure(inlineArgs []string, cfg *config.Map) error {
 	cfg.StringList("targets", false, false, nil, &targetsArg)
 	cfg.Custom("auth", false, false, func() (interface{}, error) {
 		return nil, nil
-	}, saslAuthDirective, &u.saslFactory)
+	}, saslAuthDirective, &u.saslCfg)
 	cfg.Custom("tls_client", true, false, func() (interface{}, error) {
 		return &tls.Config{}, nil
 	}, tls2.TLSClientBlock, &u.tlsConfig)
 	cfg.Duration("connect_timeout", false, false, 5*time.Minute, &u.connectTimeout)
 	cfg.Duration("command_timeout", false, false, 5*time.Minute, &u.commandTimeout)
 	cfg.Duration("submission_timeout", false, false, 5*time.Minute, &u.submissionTimeout)
+	cfg.Int("conn_reuse_limit", false, false, 0, &u.connReuseLimit)
+	cfg.Int("conn_max_idle_count", false, false, 5, &u.connMaxIdleCount)
+	cfg.Int64("conn_max_idle_time", false, false, 150, &u.connMaxIdleTime)
 
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -156,6 +167,15 @@ func (u *Downstream) Configure(inlineArgs []string, cfg *config.Map) error {
 		return fmt.Errorf("%s: at least one target endpoint is required", u.modName)
 	}
 
+	if u.connReuseLimit > 0 {
+		u.pool = pool.New(pool.Config{
+			MaxKeys:             5000,
+			MaxConnsPerKey:      u.connMaxIdleCount,
+			MaxConnLifetimeSec:  u.connMaxIdleTime,
+			StaleKeyLifetimeSec: u.connMaxIdleTime * 2,
+		})
+	}
+
 	return nil
 }
 
@@ -167,6 +187,21 @@ func (u *Downstream) InstanceName() string {
 	return u.instName
 }
 
+// Start implements container.LifetimeModule. It is a no-op for downstream
+// targets — the pool (if any) is created during Configure.
+func (u *Downstream) Start() error {
+	return nil
+}
+
+// Stop implements container.LifetimeModule. It drains and closes all idle
+// connections in the pool.
+func (u *Downstream) Stop() error {
+	if u.pool != nil {
+		u.pool.Close()
+	}
+	return nil
+}
+
 type delivery struct {
 	u   *Downstream
 	log *log.Logger
@@ -175,7 +210,9 @@ type delivery struct {
 	mailFrom string
 	rcpts    []string
 
-	conn *smtpconn.C
+	conn       *smtpconn.C
+	pooledConn *downstreamConn // non-nil when pooling is active
+	poolKey    string          // pool key for Return; empty when pooling disabled
 }
 
 // lmtpDelivery implements module.PartialDelivery
@@ -197,9 +234,7 @@ func (u *Downstream) StartDelivery(ctx context.Context, msgMeta *module.MsgMetad
 	}
 
 	if err := d.conn.Mail(ctx, mailFrom, msgMeta.SMTPOpts); err != nil {
-		if err := d.conn.Close(); err != nil {
-			u.log.Error("failed to close smtp connection", err)
-		}
+		d.closeConn(d.conn)
 		return nil, err
 	}
 
@@ -217,24 +252,40 @@ func (d *delivery) closeConn(c *smtpconn.C) {
 }
 
 func (d *delivery) connect(ctx context.Context) error {
-	// TODO: Review possibility of connection pooling here.
 	var lastErr error
 
-	conn := smtpconn.New()
-	conn.Log = d.log
-	conn.Hostname = d.u.hostname
-	conn.AddrInSMTPMsg = false
-	if d.u.connectTimeout != 0 {
-		conn.ConnectTimeout = d.u.connectTimeout
-	}
-	if d.u.commandTimeout != 0 {
-		conn.CommandTimeout = d.u.commandTimeout
-	}
-	if d.u.submissionTimeout != 0 {
-		conn.SubmissionTimeout = d.u.submissionTimeout
-	}
-
 	for _, endp := range d.u.endpoints {
+		// --- Try pool first (if enabled) ---
+		if d.u.pool != nil {
+			pk := d.u.poolKeyFor(endp, d.msgMeta)
+			pooledConn, _ := d.u.pool.Get(ctx, pk)
+			if pooledConn != nil {
+				dc := pooledConn.(*downstreamConn)
+				dc.Log = d.log
+				d.conn = dc.C
+				d.pooledConn = dc
+				d.poolKey = pk
+				d.log.DebugMsg("reusing pooled connection", "downstream_server", dc.ServerName(),
+					"transactions", dc.transactions)
+				return nil
+			}
+		}
+
+		// --- Create a fresh connection ---
+		conn := smtpconn.New()
+		conn.Log = d.log
+		conn.Hostname = d.u.hostname
+		conn.AddrInSMTPMsg = false
+		if d.u.connectTimeout != 0 {
+			conn.ConnectTimeout = d.u.connectTimeout
+		}
+		if d.u.commandTimeout != 0 {
+			conn.CommandTimeout = d.u.commandTimeout
+		}
+		if d.u.submissionTimeout != 0 {
+			conn.SubmissionTimeout = d.u.submissionTimeout
+		}
+
 		var err error
 		if d.u.lmtp {
 			_, err = conn.ConnectLMTP(ctx, endp, d.u.starttls, d.u.tlsConfig)
@@ -251,29 +302,55 @@ func (d *delivery) connect(ctx context.Context) error {
 
 		d.log.DebugMsg("connected", "downstream_server", conn.ServerName())
 
-		lastErr = nil
-		break
+		// SASL authentication (new connections only; pooled connections are
+		// already authenticated for the credentials encoded in the pool key).
+		if d.u.saslCfg != nil && d.u.saslCfg.factory != nil {
+			saslClient, saslErr := d.u.saslCfg.factory(d.msgMeta)
+			if saslErr != nil {
+				d.closeConn(conn)
+				lastErr = saslErr
+				continue
+			}
+
+			if authErr := conn.Client().Auth(saslClient); authErr != nil {
+				d.closeConn(conn)
+				lastErr = authErr
+				continue
+			}
+		}
+
+		d.conn = conn
+
+		// Wrap in downstreamConn for pool tracking if pooling is enabled.
+		if d.u.pool != nil {
+			pk := d.u.poolKeyFor(endp, d.msgMeta)
+			d.pooledConn = &downstreamConn{
+				C:          conn,
+				reuseLimit: d.u.connReuseLimit,
+				lastUse:    time.Now(),
+			}
+			d.poolKey = pk
+		}
+
+		return nil
 	}
+
 	if lastErr != nil {
 		return d.u.moduleError(lastErr)
 	}
+	return d.u.moduleError(fmt.Errorf("no endpoints configured"))
+}
 
-	if d.u.saslFactory != nil {
-		saslClient, err := d.u.saslFactory(d.msgMeta)
-		if err != nil {
-			d.closeConn(conn)
-			return err
-		}
-
-		if err := conn.Client().Auth(saslClient); err != nil {
-			d.closeConn(conn)
-			return err
-		}
+// poolKeyFor computes the pool key for the given endpoint and message
+// metadata. The key encodes both the endpoint identity (scheme + address) and
+// the SASL credentials so that connections authenticated with different
+// credentials are never shared.
+func (u *Downstream) poolKeyFor(endp config.Endpoint, msgMeta *module.MsgMetadata) string {
+	key := endp.Scheme + "://" + endp.Address()
+	if u.saslCfg != nil && u.saslCfg.identity != nil {
+		key += "\x00" + u.saslCfg.identity(msgMeta)
 	}
-
-	d.conn = conn
-
-	return nil
+	return key
 }
 
 func (d *delivery) AddRcpt(ctx context.Context, rcptTo string, opts smtp.RcptOptions) error {
@@ -297,7 +374,11 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 			d.log.Msg("failed to close body buffer", err)
 		}
 	}()
-	return d.u.moduleError(d.conn.Data(ctx, header, r))
+	dataErr := d.conn.Data(ctx, header, r)
+	if dataErr != nil && d.pooledConn != nil {
+		d.pooledConn.errored = true
+	}
+	return d.u.moduleError(dataErr)
 }
 
 func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollector, header textproto.Header, body buffer.Buffer) {
@@ -330,6 +411,9 @@ func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollec
 		rcptIndx++
 	})
 	if err != nil {
+		if d.pooledConn != nil {
+			d.pooledConn.errored = true
+		}
 		modErr := d.u.moduleError(err)
 		for _, rcpt := range d.rcpts[rcptIndx:] {
 			sc.SetStatus(rcpt, modErr)
@@ -342,6 +426,14 @@ func (d *delivery) Abort(ctx context.Context) error {
 }
 
 func (d *delivery) Commit(ctx context.Context) error {
+	if d.pooledConn != nil {
+		d.pooledConn.transactions++
+		d.pooledConn.lastUse = time.Now()
+		if d.pooledConn.Usable() {
+			d.u.pool.Return(d.poolKey, d.pooledConn)
+			return nil
+		}
+	}
 	return d.conn.Close()
 }
 

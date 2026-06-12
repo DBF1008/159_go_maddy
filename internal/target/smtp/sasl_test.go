@@ -28,15 +28,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func testSaslFactory(t *testing.T, args ...string) saslClientFactory {
-	factory, err := saslAuthDirective(&config.Map{}, config.Node{
+func testSaslFactory(t *testing.T, args ...string) *saslConfig {
+	cfg, err := saslAuthDirective(&config.Map{}, config.Node{
 		Name: "auth",
 		Args: args,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return factory.(saslClientFactory)
+	return cfg.(*saslConfig)
 }
 
 func TestSASL_Plain(t *testing.T) {
@@ -55,7 +55,7 @@ func TestSASL_Plain(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		saslFactory: testSaslFactory(t, "plain", "test", "testpass"),
+		saslCfg: testSaslFactory(t, "plain", "test", "testpass"),
 		log:         testutils.Logger(t, "target.smtp"),
 	}
 
@@ -91,7 +91,7 @@ func TestSASL_Plain_AuthFail(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		saslFactory: testSaslFactory(t, "plain", "test", "testpass"),
+		saslCfg: testSaslFactory(t, "plain", "test", "testpass"),
 		log:         testutils.Logger(t, "target.smtp"),
 	}
 
@@ -102,8 +102,8 @@ func TestSASL_Plain_AuthFail(t *testing.T) {
 }
 
 func TestSASL_Login_Directive(t *testing.T) {
-	factory := testSaslFactory(t, "login", "test", "testpass")
-	client, err := factory(nil)
+	cfg := testSaslFactory(t, "login", "test", "testpass")
+	client, err := cfg.factory(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestSASL_Forward(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		saslFactory: testSaslFactory(t, "forward"),
+		saslCfg: testSaslFactory(t, "forward"),
 		log:         testutils.Logger(t, "target.smtp"),
 	}
 
@@ -169,7 +169,7 @@ func TestSASL_Forward_NoCreds(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		saslFactory: testSaslFactory(t, "forward"),
+		saslCfg: testSaslFactory(t, "forward"),
 		log:         testutils.Logger(t, "target.smtp"),
 	}
 
